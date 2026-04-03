@@ -5,6 +5,8 @@
 #ifndef INCLUDE_V8_TEMPLATE_H_
 #define INCLUDE_V8_TEMPLATE_H_
 
+#include <stddef.h>
+
 #include <cstddef>
 #include <string_view>
 

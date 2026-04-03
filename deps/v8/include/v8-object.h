@@ -5,6 +5,8 @@
 #ifndef INCLUDE_V8_OBJECT_H_
 #define INCLUDE_V8_OBJECT_H_
 
+#include <stddef.h>
+
 #include "cppgc/garbage-collected.h"
 #include "cppgc/name-provider.h"
 #include "v8-internal.h"           // NOLINT(build/include_directory)
