@@ -52,8 +52,8 @@ auto WasmGraphBuilderBase<Assembler>::BuildChangeInt64ToBigInt(
     return V<BigInt>::Cast(__ Call(target, {input}, ts_call_descriptor));
   }
   V<Word32> low_word = __ TruncateWord64ToWord32(input);
-  V<Word32> high_word = __ TruncateWord64ToWord32(__ ShiftRightLogical(
-      input, __ Word32Constant(32), WordRepresentation::Word64()));
+  V<Word32> high_word =
+      __ TruncateWord64ToWord32(__ Word64ShiftRightLogical(input, 32));
   return V<BigInt>::Cast(
       __ Call(target, {low_word, high_word}, ts_call_descriptor));
 }
@@ -110,9 +110,10 @@ inline auto WasmGraphBuilderBase<Assembler>::BuildFunctionTargetAndImplicitArg(
           internal_function, LoadOp::Kind::TaggedBase().Immutable(),
           WasmInternalFunction::kProtectedImplicitArgOffset));
 
-  V<Word32> target = __ Load(internal_function, LoadOp::Kind::TaggedBase(),
-                             MemoryRepresentation::Uint32(),
-                             WasmInternalFunction::kRawCallTargetOffset);
+  V<Word32> target =
+      __ Load(internal_function, LoadOp::Kind::TaggedBase().Immutable(),
+              MemoryRepresentation::Uint32(),
+              WasmInternalFunction::kRawCallTargetOffset);
 
   return {target, implicit_arg};
 }
@@ -124,6 +125,7 @@ WasmGraphBuilderBase<Assembler>::RepresentationFor(ValueTypeBase type) {
     case kI8:
     case kI16:
     case kI32:
+    case kWaitQueue:
       return RegisterRepresentation::Word32();
     case kI64:
       return RegisterRepresentation::Word64();
@@ -172,7 +174,7 @@ void WasmGraphBuilderBase<Assembler>::BuildSetNewStackLimit(
   // Set the new interrupt limit and real limit. Use a compare-and-swap for
   // the interrupt limit to avoid overwriting a pending interrupt.
   __ AtomicCompareExchange(
-      __ IsolateField(IsolateFieldId::kJsLimitAddress), __ UintPtrConstant(0),
+      __ IsolateField(IsolateFieldId::kJsLimit), __ UintPtrConstant(0),
       old_limit, new_limit, RegisterRepresentation::WordPtr(),
       MemoryRepresentation::UintPtr(), compiler::MemoryAccessKind::kNormal,
       RegisterRepresentation::WordPtr());
