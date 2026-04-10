@@ -4,6 +4,7 @@
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
 #include <sstream>
+#include <string>
 #include "aliased_buffer.h"
 #include "base_object.h"
 #include "json_utils.h"
@@ -17,6 +18,7 @@ class Environment;
 struct InternalFieldInfoBase;
 
 namespace v8_utils {
+
 class BindingData : public SnapshotableObject {
  public:
   struct InternalFieldInfo : public node::InternalFieldInfoBase {
@@ -34,6 +36,12 @@ class BindingData : public SnapshotableObject {
   AliasedFloat64Array heap_statistics_buffer;
   AliasedFloat64Array heap_space_statistics_buffer;
   AliasedFloat64Array heap_code_statistics_buffer;
+
+  // Reference to the JS AsyncLocalStorage instance used by
+  // withHeapProfileLabels/setHeapProfileLabels. The V8 callback uses this
+  // as the key to look up label values in the stored CPED (AsyncContextFrame
+  // Map) at profile-read time.
+  v8::Global<v8::Value> heap_profile_labels_als_key;
 
   void MemoryInfo(MemoryTracker* tracker) const override;
   SET_SELF_SIZE(BindingData)

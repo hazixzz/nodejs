@@ -123,6 +123,8 @@ v8::Maybe<void> InitializePrimordials(v8::Local<v8::Context> context,
 v8::MaybeLocal<v8::Object> InitializePrivateSymbols(
     v8::Local<v8::Context> context, IsolateData* isolate_data);
 
+class ProfilingArrayBufferAllocator;  // Forward declaration.
+
 class NodeArrayBufferAllocator : public ArrayBufferAllocator {
  public:
   void* Allocate(size_t size) override;  // Defined in src/node.cc
@@ -136,6 +138,9 @@ class NodeArrayBufferAllocator : public ArrayBufferAllocator {
   }
 
   NodeArrayBufferAllocator* GetImpl() final { return this; }
+  virtual ProfilingArrayBufferAllocator* GetProfilingAllocator() {
+    return nullptr;
+  }
   inline uint64_t total_mem_usage() const {
     return total_mem_usage_.load(std::memory_order_relaxed);
   }
@@ -162,6 +167,50 @@ class DebuggingArrayBufferAllocator final : public NodeArrayBufferAllocator {
   void UnregisterPointerInternal(void* data, size_t size);
   Mutex mutex_;
   std::unordered_map<void*, size_t> allocations_;
+};
+
+// Subclass of NodeArrayBufferAllocator that tracks per-label external memory
+// (Buffer/ArrayBuffer backing stores) when heap profiling with labels is active.
+// When disabled (default), overhead is a single relaxed atomic load per alloc.
+class ProfilingArrayBufferAllocator : public NodeArrayBufferAllocator {
+ public:
+  using LabelPairs = std::vector<std::pair<std::string, std::string>>;
+
+  struct LabeledBytes {
+    LabelPairs labels;
+    int64_t bytes = 0;
+  };
+
+  void* Allocate(size_t size) override;
+  void* AllocateUninitialized(size_t size) override;
+  void Free(void* data, size_t size) override;
+  ProfilingArrayBufferAllocator* GetProfilingAllocator() override {
+    return this;
+  }
+
+  // Called from StartSamplingHeapProfiler/StopSamplingHeapProfiler.
+  void Enable(v8::Isolate* isolate, v8::Global<v8::Value>* als_key);
+  void Disable();
+
+  // Returns per-label live external bytes (for getAllocationProfile).
+  std::vector<LabeledBytes> GetPerLabelBytes() const;
+
+ private:
+  LabelPairs FindCurrentLabels();
+  static std::string SerializeLabels(const LabelPairs& labels);
+
+  std::atomic<bool> enabled_{false};
+  v8::Isolate* isolate_ = nullptr;
+  // Borrowed pointer to BindingData::heap_profile_labels_als_key.
+  v8::Global<v8::Value>* als_key_ = nullptr;
+
+  std::thread::id main_thread_id_ = std::this_thread::get_id();
+
+  mutable Mutex mutex_;
+  // Maps allocation pointer to {serialized_label_key, size}.
+  std::unordered_map<void*, std::pair<std::string, size_t>> allocations_;
+  // Per-serialized-label-key entry with full labels and live bytes.
+  std::unordered_map<std::string, LabeledBytes> per_label_bytes_;
 };
 
 namespace Buffer {

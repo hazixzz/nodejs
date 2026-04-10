@@ -25,13 +25,16 @@
 #include "env-inl.h"
 #include "memory_tracker-inl.h"
 #include "node.h"
+#include "node_internals.h"
 #include "node_external_reference.h"
 #include "util-inl.h"
+#include "v8-container.h"
 #include "v8-profiler.h"
 #include "v8.h"
 
 namespace node {
 namespace v8_utils {
+using v8::AllocationProfile;
 using v8::Array;
 using v8::BigInt;
 using v8::CFunction;
@@ -44,12 +47,14 @@ using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
 using v8::HeapCodeStatistics;
+using v8::HeapProfiler;
 using v8::HeapSpaceStatistics;
 using v8::HeapStatistics;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
 using v8::LocalVector;
+using v8::Map;
 using v8::MaybeLocal;
 using v8::Number;
 using v8::Object;
@@ -58,6 +63,63 @@ using v8::String;
 using v8::Uint32;
 using v8::V8;
 using v8::Value;
+
+// V8 callback invoked at profile-read time (BuildSamples) for each sample
+// that has a stored CPED. Receives the CPED (AsyncContextFrame = JS Map),
+// looks up the heap profile labels ALS store value, and converts the
+// pre-flattened [key1, val1, key2, val2, ...] array to string pairs.
+// Labels are pre-flattened in JS at label-set time because this callback
+// runs during BuildSamples() iteration — V8 Object property access
+// (GetOwnPropertyNames) allocates and can trigger GC, which removes samples
+// via weak callbacks and invalidates the iterator. Dense array access
+// (Array::Get on PACKED_ELEMENTS) does NOT allocate V8 objects.
+static bool HeapProfileLabelsCallback(
+    void* data, v8::Local<v8::Value> context,
+    std::vector<std::pair<std::string, std::string>>* out_labels) {
+  auto* binding_data = static_cast<BindingData*>(data);
+  if (!binding_data) return false;
+  if (binding_data->heap_profile_labels_als_key.IsEmpty()) return false;
+
+  // The stored CPED is an AsyncContextFrame (extends Map).
+  if (context.IsEmpty() || !context->IsMap()) return false;
+
+  Isolate* isolate = binding_data->env()->isolate();
+  HandleScope handle_scope(isolate);
+  Local<v8::Context> v8_context = isolate->GetCurrentContext();
+
+  Local<Map> frame = context.As<Map>();
+  Local<Value> als_key =
+      binding_data->heap_profile_labels_als_key.Get(isolate);
+
+  // Look up the labels ALS store value in the AsyncContextFrame.
+  Local<Value> labels_val;
+  if (!frame->Get(v8_context, als_key).ToLocal(&labels_val) ||
+      !labels_val->IsArray()) {
+    return false;
+  }
+
+  // Convert flat [key1, val1, key2, val2, ...] array to string pairs.
+  Local<Array> flat = labels_val.As<Array>();
+  uint32_t len = flat->Length();
+  for (uint32_t i = 0; i + 1 < len; i += 2) {
+    Local<Value> key_val, val_val;
+    if (!flat->Get(v8_context, i).ToLocal(&key_val)) return false;
+    if (!flat->Get(v8_context, i + 1).ToLocal(&val_val)) return false;
+    String::Utf8Value key(isolate, key_val);
+    String::Utf8Value val(isolate, val_val);
+    out_labels->emplace_back(*key, *val);
+  }
+  return !out_labels->empty();
+}
+
+// C++ binding: store the AsyncLocalStorage instance used for heap profile
+// labels. The callback uses this as the Map key to look up labels in the
+// stored CPED (AsyncContextFrame) at profile-read time.
+void SetHeapProfileLabelsStore(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  BindingData* binding_data = Realm::GetBindingData<BindingData>(args);
+  binding_data->heap_profile_labels_als_key.Reset(isolate, args[0]);
+}
 
 #define HEAP_STATISTICS_PROPERTIES(V)                                          \
   V(0, total_heap_size, kTotalHeapSizeIndex)                                   \
@@ -186,6 +248,9 @@ void BindingData::MemoryInfo(MemoryTracker* tracker) const {
                       heap_space_statistics_buffer);
   tracker->TrackField("heap_code_statistics_buffer",
                       heap_code_statistics_buffer);
+  tracker->TrackFieldWithSize("heap_profile_labels_als_key",
+                              heap_profile_labels_als_key.IsEmpty() ? 0 :
+                                  sizeof(v8::Global<v8::Value>));
 }
 
 void CachedDataVersionTag(const FunctionCallbackInfo<Value>& args) {
@@ -673,6 +738,171 @@ void GCProfiler::Stop(const FunctionCallbackInfo<v8::Value>& args) {
   }
 }
 
+void StartSamplingHeapProfiler(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  HeapProfiler* profiler = isolate->GetHeapProfiler();
+  BindingData* binding_data = Realm::GetBindingData<BindingData>(args);
+  uint64_t interval = 512 * 1024;  // Default: 512 KB
+  if (args.Length() > 0 && args[0]->IsNumber()) {
+    interval = static_cast<uint64_t>(args[0].As<Number>()->Value());
+  }
+  int stack_depth = 16;  // Default stack depth
+  if (args.Length() > 1 && args[1]->IsNumber()) {
+    stack_depth = static_cast<int>(args[1].As<Number>()->Value());
+  }
+  profiler->SetHeapProfileSampleLabelsCallback(
+      HeapProfileLabelsCallback, binding_data);
+  // By default, GC'd samples are removed from the profile (live-memory mode).
+  // When includeCollectedObjects is true, retain GC'd samples so allocation
+  // attribution reflects total allocations (allocation-rate mode).
+  v8::HeapProfiler::SamplingFlags flags =
+      static_cast<v8::HeapProfiler::SamplingFlags>(
+          v8::HeapProfiler::kSamplingNoFlags);
+  if (args.Length() > 2 && args[2]->IsObject()) {
+    Local<Object> options = args[2].As<Object>();
+    Local<String> key = String::NewFromUtf8Literal(isolate,
+                                                    "includeCollectedObjects");
+    Local<Value> val;
+    if (options->Get(context, key).ToLocal(&val) && val->IsTrue()) {
+      flags = static_cast<v8::HeapProfiler::SamplingFlags>(
+          v8::HeapProfiler::kSamplingIncludeObjectsCollectedByMajorGC |
+          v8::HeapProfiler::kSamplingIncludeObjectsCollectedByMinorGC);
+    }
+  }
+  profiler->StartSamplingHeapProfiler(interval, stack_depth, flags);
+
+  // Enable external memory tracking on the allocator if it supports profiling.
+  Environment* env = Environment::GetCurrent(args);
+  auto* node_allocator = env->isolate_data()->node_allocator();
+  auto* profiling_allocator = node_allocator != nullptr
+      ? node_allocator->GetProfilingAllocator() : nullptr;
+  if (profiling_allocator != nullptr) {
+    profiling_allocator->Enable(
+        isolate, &binding_data->heap_profile_labels_als_key);
+  }
+}
+
+void StopSamplingHeapProfiler(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HeapProfiler* profiler = isolate->GetHeapProfiler();
+  profiler->StopSamplingHeapProfiler();
+  profiler->SetHeapProfileSampleLabelsCallback(nullptr, nullptr);
+
+  Environment* env = Environment::GetCurrent(args);
+  auto* node_allocator = env->isolate_data()->node_allocator();
+  auto* profiling_allocator = node_allocator != nullptr
+      ? node_allocator->GetProfilingAllocator() : nullptr;
+  if (profiling_allocator != nullptr) {
+    profiling_allocator->Disable();
+  }
+}
+
+void GetAllocationProfile(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HeapProfiler* profiler = isolate->GetHeapProfiler();
+  HandleScope scope(isolate);
+  Local<Context> context = isolate->GetCurrentContext();
+
+  std::unique_ptr<AllocationProfile> profile(profiler->GetAllocationProfile());
+  if (!profile) {
+    return;  // Returns undefined if profiler not started
+  }
+
+  const std::vector<AllocationProfile::Sample>& samples = profile->GetSamples();
+  Local<Array> js_samples = Array::New(isolate, samples.size());
+
+  for (size_t i = 0; i < samples.size(); i++) {
+    const AllocationProfile::Sample& sample = samples[i];
+    Local<Object> js_sample = Object::New(isolate);
+
+    if (js_sample->Set(context,
+                       FIXED_ONE_BYTE_STRING(isolate, "nodeId"),
+                       Integer::NewFromUnsigned(isolate, sample.node_id))
+            .IsNothing()) return;
+    if (js_sample->Set(context,
+                       FIXED_ONE_BYTE_STRING(isolate, "size"),
+                       Number::New(isolate, static_cast<double>(sample.size)))
+            .IsNothing()) return;
+    if (js_sample->Set(context,
+                       FIXED_ONE_BYTE_STRING(isolate, "count"),
+                       Integer::NewFromUnsigned(isolate, sample.count))
+            .IsNothing()) return;
+    if (js_sample->Set(context,
+                       FIXED_ONE_BYTE_STRING(isolate, "sampleId"),
+                       Number::New(isolate, static_cast<double>(sample.sample_id)))
+            .IsNothing()) return;
+
+    // Always emit labels field (empty {} when no labels captured)
+    Local<Object> js_labels = Object::New(isolate);
+    for (const auto& label : sample.labels) {
+      Local<String> key;
+      if (!String::NewFromUtf8(isolate, label.first.c_str(),
+                               v8::NewStringType::kNormal)
+               .ToLocal(&key)) return;
+      Local<String> value;
+      if (!String::NewFromUtf8(isolate, label.second.c_str(),
+                               v8::NewStringType::kNormal)
+               .ToLocal(&value)) return;
+      if (js_labels->Set(context, key, value).IsNothing()) return;
+    }
+    if (js_sample->Set(context,
+                       FIXED_ONE_BYTE_STRING(isolate, "labels"),
+                       js_labels).IsNothing()) return;
+
+    if (js_samples->Set(context, i, js_sample).IsNothing()) return;
+  }
+
+  Local<Object> result = Object::New(isolate);
+  if (result->Set(context,
+                  FIXED_ONE_BYTE_STRING(isolate, "samples"),
+                  js_samples).IsNothing()) return;
+
+  // Include per-label external memory (Buffer/ArrayBuffer) if profiling
+  // allocator is active. Each entry has { labels: { key: val, ... }, bytes: N }
+  // matching the labels structure used in heap samples.
+  Environment* env = Environment::GetCurrent(args);
+  auto* node_allocator = env->isolate_data()->node_allocator();
+  auto* profiling_allocator = node_allocator != nullptr
+      ? node_allocator->GetProfilingAllocator() : nullptr;
+  if (profiling_allocator != nullptr) {
+    auto per_label = profiling_allocator->GetPerLabelBytes();
+    if (!per_label.empty()) {
+      Local<Array> js_external = Array::New(isolate, per_label.size());
+      for (size_t idx = 0; idx < per_label.size(); idx++) {
+        const auto& entry = per_label[idx];
+        Local<Object> js_entry = Object::New(isolate);
+        Local<Object> js_labels = Object::New(isolate);
+        for (const auto& [lk, lv] : entry.labels) {
+          Local<String> key;
+          if (!String::NewFromUtf8(isolate, lk.c_str(),
+                                   v8::NewStringType::kNormal)
+                   .ToLocal(&key)) return;
+          Local<String> value;
+          if (!String::NewFromUtf8(isolate, lv.c_str(),
+                                   v8::NewStringType::kNormal)
+                   .ToLocal(&value)) return;
+          if (js_labels->Set(context, key, value).IsNothing()) return;
+        }
+        if (js_entry->Set(context,
+                          FIXED_ONE_BYTE_STRING(isolate, "labels"),
+                          js_labels).IsNothing()) return;
+        if (js_entry->Set(context,
+                          FIXED_ONE_BYTE_STRING(isolate, "bytes"),
+                          Number::New(isolate,
+                                      static_cast<double>(entry.bytes)))
+                .IsNothing()) return;
+        if (js_external->Set(context, idx, js_entry).IsNothing()) return;
+      }
+      if (result->Set(context,
+                      FIXED_ONE_BYTE_STRING(isolate, "externalBytes"),
+                      js_external).IsNothing()) return;
+    }
+  }
+
+  args.GetReturnValue().Set(result);
+}
+
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
@@ -681,6 +911,40 @@ void Initialize(Local<Object> target,
   Environment* env = realm->env();
   BindingData* const binding_data = realm->AddBindingData<BindingData>(target);
   if (binding_data == nullptr) return;
+
+  // Clean up heap profiler state on Environment teardown.
+  // If the profiler was started but not stopped, V8's HeapProfiler holds
+  // a raw void* to BindingData and the allocator borrows label_map_.
+  // Clear these before destroying BindingData to prevent dangling pointers.
+  //
+  // Capture isolate and allocator pointers at registration time because
+  // BindingData->env() may not be safe to dereference during cleanup.
+  {
+    Isolate* isolate = env->isolate();
+    auto* node_allocator = env->isolate_data()->node_allocator();
+    auto* profiling_allocator = node_allocator != nullptr
+        ? node_allocator->GetProfilingAllocator() : nullptr;
+    struct CleanupData {
+      BindingData* binding_data;
+      Isolate* isolate;
+      ProfilingArrayBufferAllocator* profiling_allocator;
+    };
+    auto* cleanup = new CleanupData{binding_data, isolate,
+                                    profiling_allocator};
+    env->AddCleanupHook([](void* data) {
+      auto* ctx = static_cast<CleanupData*>(data);
+
+      // Clear V8 callback pointer that references the BindingData.
+      ctx->isolate->GetHeapProfiler()->SetHeapProfileSampleLabelsCallback(
+          nullptr, nullptr);
+
+      if (ctx->profiling_allocator != nullptr) {
+        ctx->profiling_allocator->Disable();
+      }
+
+      delete ctx;
+    }, cleanup);
+  }
 
   SetMethodNoSideEffect(
       context, target, "cachedDataVersionTag", CachedDataVersionTag);
@@ -741,6 +1005,16 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "startCpuProfile", StartCpuProfile);
   SetMethod(context, target, "stopCpuProfile", StopCpuProfile);
 
+  // Sampling heap profiler with context support
+  SetMethod(context, target, "startSamplingHeapProfiler",
+            StartSamplingHeapProfiler);
+  SetMethod(context, target, "stopSamplingHeapProfiler",
+            StopSamplingHeapProfiler);
+  SetMethod(context, target, "getAllocationProfile",
+            GetAllocationProfile);
+  SetMethod(context, target, "setHeapProfileLabelsStore",
+            SetHeapProfileLabelsStore);
+
   // Export symbols used by v8.isStringOneByteRepresentation()
   SetFastMethodNoSideEffect(context,
                             target,
@@ -787,6 +1061,10 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(fast_is_string_one_byte_representation_);
   registry->Register(StartCpuProfile);
   registry->Register(StopCpuProfile);
+  registry->Register(StartSamplingHeapProfiler);
+  registry->Register(StopSamplingHeapProfiler);
+  registry->Register(GetAllocationProfile);
+  registry->Register(SetHeapProfileLabelsStore);
 }
 
 }  // namespace v8_utils

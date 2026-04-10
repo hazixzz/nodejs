@@ -15,6 +15,7 @@
 #include "node_realm-inl.h"
 #include "node_shadow_realm.h"
 #include "node_snapshot_builder.h"
+#include "node_v8.h"
 #include "node_v8_platform-inl.h"
 #include "node_wasm_web_api.h"
 #include "uv.h"
@@ -191,11 +192,159 @@ void DebuggingArrayBufferAllocator::RegisterPointerInternal(void* data,
   allocations_[data] = size;
 }
 
+void* ProfilingArrayBufferAllocator::Allocate(size_t size) {
+  void* ret = NodeArrayBufferAllocator::Allocate(size);
+  if (ret != nullptr && enabled_.load(std::memory_order_acquire)) {
+    LabelPairs labels = FindCurrentLabels();
+    if (!labels.empty()) {
+      std::string key = SerializeLabels(labels);
+      Mutex::ScopedLock lock(mutex_);
+      allocations_[ret] = {key, size};
+      auto& entry = per_label_bytes_[key];
+      if (entry.labels.empty()) entry.labels = std::move(labels);
+      entry.bytes += static_cast<int64_t>(size);
+    }
+  }
+  return ret;
+}
+
+void* ProfilingArrayBufferAllocator::AllocateUninitialized(size_t size) {
+  void* ret = NodeArrayBufferAllocator::AllocateUninitialized(size);
+  if (ret != nullptr && enabled_.load(std::memory_order_acquire)) {
+    LabelPairs labels = FindCurrentLabels();
+    if (!labels.empty()) {
+      std::string key = SerializeLabels(labels);
+      Mutex::ScopedLock lock(mutex_);
+      allocations_[ret] = {key, size};
+      auto& entry = per_label_bytes_[key];
+      if (entry.labels.empty()) entry.labels = std::move(labels);
+      entry.bytes += static_cast<int64_t>(size);
+    }
+  }
+  return ret;
+}
+
+void ProfilingArrayBufferAllocator::Free(void* data, size_t size) {
+  if (enabled_.load(std::memory_order_acquire)) {
+    Mutex::ScopedLock lock(mutex_);
+    auto it = allocations_.find(data);
+    if (it != allocations_.end()) {
+      auto label_it = per_label_bytes_.find(it->second.first);
+      if (label_it != per_label_bytes_.end()) {
+        label_it->second.bytes -= static_cast<int64_t>(it->second.second);
+      }
+      allocations_.erase(it);
+    }
+  }
+  NodeArrayBufferAllocator::Free(data, size);
+}
+
+void ProfilingArrayBufferAllocator::Enable(
+    v8::Isolate* isolate, v8::Global<v8::Value>* als_key) {
+  Mutex::ScopedLock lock(mutex_);
+  isolate_ = isolate;
+  als_key_ = als_key;
+  main_thread_id_ = std::this_thread::get_id();
+  enabled_.store(true, std::memory_order_release);
+}
+
+void ProfilingArrayBufferAllocator::Disable() {
+  enabled_.store(false, std::memory_order_release);
+  Mutex::ScopedLock lock(mutex_);
+  allocations_.clear();
+  per_label_bytes_.clear();
+  isolate_ = nullptr;
+  als_key_ = nullptr;
+}
+
+std::vector<ProfilingArrayBufferAllocator::LabeledBytes>
+ProfilingArrayBufferAllocator::GetPerLabelBytes() const {
+  Mutex::ScopedLock lock(mutex_);
+  std::vector<LabeledBytes> result;
+  for (const auto& [key, entry] : per_label_bytes_) {
+    if (entry.bytes > 0) {
+      result.push_back(entry);
+    }
+  }
+  return result;
+}
+
+std::string ProfilingArrayBufferAllocator::SerializeLabels(
+    const LabelPairs& labels) {
+  std::string key;
+  for (const auto& [k, v] : labels) {
+    if (!key.empty()) key += '\0';
+    key += k;
+    key += '\0';
+    key += v;
+  }
+  return key;
+}
+
+ProfilingArrayBufferAllocator::LabelPairs
+ProfilingArrayBufferAllocator::FindCurrentLabels() {
+  // Skip non-main-thread allocations (SharedArrayBuffer from workers).
+  if (std::this_thread::get_id() != main_thread_id_) return {};
+  if (isolate_ == nullptr || als_key_ == nullptr || als_key_->IsEmpty()) {
+    return {};
+  }
+
+  // Read CPED via public V8 API. This is safe because:
+  // 1. ArrayBuffer allocator runs in normal JS context, not during GC
+  // 2. HandleScope is always active during JS execution
+  v8::Local<v8::Value> cped =
+      isolate_->GetContinuationPreservedEmbedderData();
+  if (cped.IsEmpty() || !cped->IsMap()) return {};
+
+  v8::HandleScope handle_scope(isolate_);
+  v8::Local<v8::Context> context = isolate_->GetCurrentContext();
+  v8::Local<v8::Map> frame = cped.As<v8::Map>();
+  v8::Local<v8::Value> als_key = als_key_->Get(isolate_);
+
+  // Cannot use Map::Get() here — it calls a JS builtin which is not safe
+  // in DisallowJavascriptExecution (ArrayBuffer allocator is called from
+  // BackingStore::Allocate inside the ArrayBuffer constructor).
+  // Use AsArray() which reads the internal backing store directly without
+  // calling JS builtins, then iterate entries by identity comparison.
+  v8::Local<v8::Array> entries = frame->AsArray();
+  uint32_t entries_len = entries->Length();
+  for (uint32_t i = 0; i + 1 < entries_len; i += 2) {
+    v8::Local<v8::Value> entry_key;
+    if (!entries->Get(context, i).ToLocal(&entry_key)) continue;
+    if (!entry_key->StrictEquals(als_key)) continue;
+
+    // Found the labels ALS entry — value is the flat array.
+    v8::Local<v8::Value> val;
+    if (!entries->Get(context, i + 1).ToLocal(&val) || !val->IsArray()) {
+      return {};
+    }
+
+    // Convert flat [key1, val1, key2, val2, ...] array to string pairs.
+    v8::Local<v8::Array> flat = val.As<v8::Array>();
+    uint32_t len = flat->Length();
+    LabelPairs result;
+    for (uint32_t j = 0; j + 1 < len; j += 2) {
+      v8::Local<v8::Value> k, v;
+      if (!flat->Get(context, j).ToLocal(&k)) return {};
+      if (!flat->Get(context, j + 1).ToLocal(&v)) return {};
+      v8::String::Utf8Value key_str(isolate_, k);
+      v8::String::Utf8Value val_str(isolate_, v);
+      result.emplace_back(*key_str, *val_str);
+    }
+    return result;
+  }
+  return {};
+}
+
 std::unique_ptr<ArrayBufferAllocator> ArrayBufferAllocator::Create(bool debug) {
   if (debug || per_process::cli_options->debug_arraybuffer_allocations)
     return std::make_unique<DebuggingArrayBufferAllocator>();
-  else
-    return std::make_unique<NodeArrayBufferAllocator>();
+  // Always use ProfilingArrayBufferAllocator so that per-label external memory
+  // tracking is available when the sampling heap profiler is started via
+  // v8.startSamplingHeapProfiler(). When profiling is disabled (the default)
+  // the only overhead is a single atomic load (enabled_.load()) on each
+  // Allocate/Free — no hash-map lookups or CPED reads occur.
+  return std::make_unique<ProfilingArrayBufferAllocator>();
 }
 
 ArrayBufferAllocator* CreateArrayBufferAllocator() {
