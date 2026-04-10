@@ -79,6 +79,21 @@ class HeapProfiler : public HeapObjectAllocationTracker {
   bool is_sampling_allocations() { return !!sampling_heap_profiler_; }
   AllocationProfile* GetAllocationProfile();
 
+#ifdef V8_HEAP_PROFILER_SAMPLE_LABELS
+  void SetHeapProfileSampleLabelsCallback(
+      v8::HeapProfiler::HeapProfileSampleLabelsCallback callback,
+      void* data) {
+    sample_labels_callback_ = callback;
+    sample_labels_data_ = data;
+  }
+
+  v8::HeapProfiler::HeapProfileSampleLabelsCallback
+  sample_labels_callback() const {
+    return sample_labels_callback_;
+  }
+  void* sample_labels_data() const { return sample_labels_data_; }
+#endif  // V8_HEAP_PROFILER_SAMPLE_LABELS
+
   void StartHeapObjectsTracking(bool track_allocations);
   void StopHeapObjectsTracking();
   AllocationTracker* allocation_tracker() const {
@@ -176,6 +191,11 @@ class HeapProfiler : public HeapObjectAllocationTracker {
   std::pair<v8::HeapProfiler::GetDetachednessCallback, void*>
       get_detachedness_callback_;
   std::unique_ptr<HeapProfilerNativeMoveListener> native_move_listener_;
+#ifdef V8_HEAP_PROFILER_SAMPLE_LABELS
+  v8::HeapProfiler::HeapProfileSampleLabelsCallback sample_labels_callback_ =
+      nullptr;
+  void* sample_labels_data_ = nullptr;
+#endif  // V8_HEAP_PROFILER_SAMPLE_LABELS
 };
 
 }  // namespace internal

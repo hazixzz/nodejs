@@ -15,6 +15,7 @@
 #include "src/execution/isolate.h"
 #include "src/heap/heap-layout-inl.h"
 #include "src/heap/heap.h"
+#include "src/profiler/heap-profiler.h"
 #include "src/profiler/strings-storage.h"
 
 namespace v8 {
@@ -96,6 +97,26 @@ void SamplingHeapProfiler::SampleObject(Address soon_object, size_t size) {
   node->allocations_[size]++;
   auto sample =
       std::make_unique<Sample>(size, node, loc, this, next_sample_id());
+
+#ifdef V8_HEAP_PROFILER_SAMPLE_LABELS
+  // If an embedder labels callback is registered, capture the CPED
+  // (ContinuationPreservedEmbedderData) for later label resolution in
+  // BuildSamples(). Storing as Global keeps the AsyncContextFrame alive
+  // and prevents it from being GC'd while the sample exists.
+  // Global::Reset is safe inside DisallowGC (uses malloc, not V8 heap).
+  {
+    HeapProfiler* hp = isolate_->heap()->heap_profiler();
+    if (hp->sample_labels_callback()) {
+      v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(isolate_);
+      v8::Local<v8::Value> context =
+          v8_isolate->GetContinuationPreservedEmbedderData();
+      if (!context.IsEmpty() && !context->IsUndefined()) {
+        sample->cped.Reset(v8_isolate, context);
+      }
+    }
+  }
+#endif  // V8_HEAP_PROFILER_SAMPLE_LABELS
+
   sample->global.SetWeak(sample.get(), OnWeakCallback,
                          WeakCallbackType::kParameter);
   samples_.emplace(sample.get(), std::move(sample));
@@ -307,14 +328,34 @@ v8::AllocationProfile* SamplingHeapProfiler::GetAllocationProfile() {
 }
 
 const std::vector<v8::AllocationProfile::Sample>
-SamplingHeapProfiler::BuildSamples() const {
+SamplingHeapProfiler::BuildSamples() {
   std::vector<v8::AllocationProfile::Sample> samples;
   samples.reserve(samples_.size());
+
+#ifdef V8_HEAP_PROFILER_SAMPLE_LABELS
+  HeapProfiler* hp = heap_->heap_profiler();
+  auto callback = hp->sample_labels_callback();
+  void* callback_data = hp->sample_labels_data();
+  v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(isolate_);
+#endif
+
   for (const auto& it : samples_) {
     const Sample* sample = it.second.get();
-    samples.emplace_back(v8::AllocationProfile::Sample{
-        sample->owner->id_, sample->size, ScaleSample(sample->size, 1).count,
-        sample->sample_id});
+#ifdef V8_HEAP_PROFILER_SAMPLE_LABELS
+    std::vector<std::pair<std::string, std::string>> labels;
+    if (callback && !sample->cped.IsEmpty()) {
+      HandleScope scope(isolate_);
+      v8::Local<v8::Value> cped_local = sample->cped.Get(v8_isolate);
+      callback(callback_data, cped_local, &labels);
+    }
+    samples.emplace_back(sample->owner->id_, sample->size,
+                         ScaleSample(sample->size, 1).count,
+                         sample->sample_id, std::move(labels));
+#else
+    samples.emplace_back(sample->owner->id_, sample->size,
+                         ScaleSample(sample->size, 1).count,
+                         sample->sample_id);
+#endif
   }
   return samples;
 }

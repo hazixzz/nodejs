@@ -114,6 +114,12 @@ class SamplingHeapProfiler {
     Global<Value> global;
     SamplingHeapProfiler* const profiler;
     const uint64_t sample_id;
+    std::vector<std::pair<std::string, std::string>> labels;
+    // ContinuationPreservedEmbedderData captured at allocation time.
+    // Stored as Global to prevent GC of the AsyncContextFrame while
+    // the sample exists. Labels are resolved from this at read time
+    // (in BuildSamples) via the registered labels callback.
+    Global<Value> cped;
   };
 
   SamplingHeapProfiler(Heap* heap, StringsStorage* names, uint64_t rate,
@@ -160,7 +166,7 @@ class SamplingHeapProfiler {
 
   void SampleObject(Address soon_object, size_t size);
 
-  const std::vector<v8::AllocationProfile::Sample> BuildSamples() const;
+  const std::vector<v8::AllocationProfile::Sample> BuildSamples();
 
   AllocationNode* FindOrAddChildNode(AllocationNode* parent, const char* name,
                                      int script_id, int start_position);
