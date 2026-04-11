@@ -4780,7 +4780,11 @@ Stats {
   atime: 2019-06-22T03:37:33.072Z,
   mtime: 2019-06-22T03:36:54.583Z,
   ctime: 2019-06-22T03:37:06.624Z,
-  birthtime: 2019-06-22T03:28:46.937Z
+  birthtime: 2019-06-22T03:28:46.937Z,
+  atimeInstant: 2019-06-22T03:37:33.071963Z,
+  mtimeInstant: 2019-06-22T03:36:54.5833518Z,
+  ctimeInstant: 2019-06-22T03:37:06.6235366Z,
+  birthtimeInstant: 2019-06-22T03:28:46.9372893Z
 }
 false
 Stats {
@@ -4801,7 +4805,11 @@ Stats {
   atime: 2019-06-22T03:36:56.619Z,
   mtime: 2019-06-22T03:36:54.584Z,
   ctime: 2019-06-22T03:36:54.584Z,
-  birthtime: 2019-06-22T03:26:47.711Z
+  birthtime: 2019-06-22T03:26:47.711Z,
+  atimeInstant: 2019-06-22T03:36:56.6188555Z,
+  mtimeInstant: 2019-06-22T03:36:54.584Z,
+  ctimeInstant: 2019-06-22T03:36:54.5838145Z,
+  birthtimeInstant: 2019-06-22T03:26:47.7107478Z
 }
 ```
 
@@ -7498,6 +7506,9 @@ i.e. before the `'ready'` event is emitted.
 <!-- YAML
 added: v0.1.21
 changes:
+  - version: REPLACEME
+    pr-url: https://github.com/nodejs/node/pull/00000
+    description: Added Temporal.Instant support.
   - version:
     - v22.0.0
     - v20.13.0
@@ -7533,10 +7544,19 @@ Stats {
   mtimeMs: 1318289051000.1,
   ctimeMs: 1318289051000.1,
   birthtimeMs: 1318289051000.1,
+
+  // Instances of Date
   atime: Mon, 10 Oct 2011 23:24:11 GMT,
   mtime: Mon, 10 Oct 2011 23:24:11 GMT,
   ctime: Mon, 10 Oct 2011 23:24:11 GMT,
-  birthtime: Mon, 10 Oct 2011 23:24:11 GMT }
+  birthtime: Mon, 10 Oct 2011 23:24:11 GMT,
+
+  // Instances of Temporal.Instant
+  atimeInstant: 2011-10-10T23:24:11.0001Z,
+  mtimeInstant: 2011-10-10T23:24:11.0001Z,
+  ctimeInstant: 2011-10-10T23:24:11.0001Z,
+  birthtimeInstant: 2011-10-10T23:24:11.0001Z
+}
 ```
 
 `bigint` version:
@@ -7561,10 +7581,19 @@ BigIntStats {
   mtimeNs: 1318289051000000000n,
   ctimeNs: 1318289051000000000n,
   birthtimeNs: 1318289051000000000n,
+
+  // Instances of Date
   atime: Mon, 10 Oct 2011 23:24:11 GMT,
   mtime: Mon, 10 Oct 2011 23:24:11 GMT,
   ctime: Mon, 10 Oct 2011 23:24:11 GMT,
-  birthtime: Mon, 10 Oct 2011 23:24:11 GMT }
+  birthtime: Mon, 10 Oct 2011 23:24:11 GMT,
+
+  // Instances of Temporal.Instant
+  atimeInstant: 2011-10-10T23:24:11Z,
+  mtimeInstant: 2011-10-10T23:24:11Z,
+  ctimeInstant: 2011-10-10T23:24:11Z,
+  birthtimeInstant: 2011-10-10T23:24:11Z
+}
 ```
 
 #### `stats.isBlockDevice()`
