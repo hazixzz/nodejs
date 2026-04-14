@@ -42,6 +42,8 @@ const path = require('path');
       assert.match(cli.output, /Use `run` to start the app again/);
     })
     .then(() => cli.command('run'))
+    .then(() => cli.waitFor(/Debugger attached\./))
+    .then(() => cli.waitForPrompt())
     .then(() => cli.waitForInitialBreak())
     .then(() => cli.waitForPrompt())
     .then(() => {
@@ -74,6 +76,8 @@ const path = require('path');
       assert.match(cli.output, /Use `run` to start the app again/);
     })
     .then(() => cli.command('run'))
+    .then(() => cli.waitFor(/Debugger attached\./))
+    .then(() => cli.waitForPrompt())
     .then(() => cli.waitForInitialBreak())
     .then(() => cli.waitForPrompt())
     .then(() => {
