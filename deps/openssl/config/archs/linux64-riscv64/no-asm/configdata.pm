@@ -237,9 +237,9 @@ our %config = (
     "openssldir" => "",
     "options" => "enable-ssl-trace enable-fips no-afalgeng no-asan no-asm no-brotli no-brotli-dynamic no-buildtest-c++ no-comp no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-devcryptoeng no-dynamic-engine no-ec_nistp_64_gcc_128 no-egd no-external-tests no-fips-jitter no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-loadereng no-md2 no-msan no-pie no-rc5 no-sctp no-shared no-ssl3 no-ssl3-method no-sslkeylog no-tfo no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
     "patch" => "6",
-    "perl_archname" => "x86_64-linux-gnu-thread-multi",
+    "perl_archname" => "x86_64-linux-thread-multi",
     "perl_cmd" => "/usr/bin/perl",
-    "perl_version" => "5.34.0",
+    "perl_version" => "5.42.1",
     "perlargv" => [
         "no-comp",
         "no-shared",
@@ -32660,8 +32660,8 @@ unless (caller) {
     use File::Copy;
     use Pod::Usage;
 
-    use lib '/node/deps/openssl/openssl/util/perl';
-    use OpenSSL::fallback '/node/deps/openssl/openssl/external/perl/MODULES.txt';
+    use lib '/home/jamie/scratch/node/deps/openssl/openssl/util/perl';
+    use OpenSSL::fallback '/home/jamie/scratch/node/deps/openssl/openssl/external/perl/MODULES.txt';
 
     my $here = dirname($0);
 
@@ -32688,7 +32688,7 @@ unless (caller) {
             );
 
         use lib '.';
-        use lib '/node/deps/openssl/openssl/Configurations';
+        use lib '/home/jamie/scratch/node/deps/openssl/openssl/Configurations';
         use gentemplate;
 
         open my $buildfile_template_fh, ">$buildfile_template"
@@ -32705,8 +32705,8 @@ unless (caller) {
 
         my $prepend = <<'_____';
 use File::Spec::Functions;
-use lib '/node/deps/openssl/openssl/util/perl';
-use lib '/node/deps/openssl/openssl/Configurations';
+use lib '/home/jamie/scratch/node/deps/openssl/openssl/util/perl';
+use lib '/home/jamie/scratch/node/deps/openssl/openssl/Configurations';
 use lib '.';
 use platform;
 _____
