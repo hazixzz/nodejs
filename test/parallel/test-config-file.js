@@ -327,7 +327,7 @@ test('non object node options', async () => {
     fixtures.path('rc/non-object-node-options.json'),
     '-p', '"Hello, World!"',
   ]);
-  assert.match(result.stderr, /"nodeOptions" value unexpected for/);
+  assert.match(result.stderr, /Invalid configuration/);
   assert.strictEqual(result.stdout, '');
   assert.strictEqual(result.code, 9);
 });
@@ -602,6 +602,66 @@ describe('namespace-scoped options', () => {
     ]);
     assert.strictEqual(result.stderr, '');
     assert.strictEqual(result.stdout, 'false\n');
+    assert.strictEqual(result.code, 0);
+  });
+});
+
+describe('JSON Schema validation', () => {
+  test('rejects boolean option with string value', async () => {
+    const result = await spawnPromisified(process.execPath, [
+      '--experimental-config-file',
+      fixtures.path('rc/invalid-schema-type.json'),
+      '-p', '"Hello"',
+    ]);
+    assert.match(result.stderr, /Invalid configuration/);
+    assert.strictEqual(result.code, 9);
+  });
+
+  test('rejects number option with string value', async () => {
+    const result = await spawnPromisified(process.execPath, [
+      '--experimental-config-file',
+      fixtures.path('rc/invalid-schema-number-as-string.json'),
+      '-p', '"Hello"',
+    ]);
+    assert.match(result.stderr, /Invalid configuration/);
+    assert.strictEqual(result.code, 9);
+  });
+
+  test('rejects array option with boolean value', async () => {
+    const result = await spawnPromisified(process.execPath, [
+      '--experimental-config-file',
+      fixtures.path('rc/invalid-schema-array-as-bool.json'),
+      '-p', '"Hello"',
+    ]);
+    assert.match(result.stderr, /Invalid configuration/);
+    assert.strictEqual(result.code, 9);
+  });
+
+  test('rejects array with wrong item type', async () => {
+    const result = await spawnPromisified(process.execPath, [
+      '--experimental-config-file',
+      fixtures.path('rc/invalid-schema-nested-type.json'),
+      '-p', '"Hello"',
+    ]);
+    assert.match(result.stderr, /Invalid configuration/);
+    assert.strictEqual(result.code, 9);
+  });
+
+  test('accepts valid config with mixed types', async () => {
+    const result = await spawnPromisified(process.execPath, [
+      '--experimental-config-file',
+      fixtures.path('rc/valid-schema-all-types.json'),
+      '-e', 'process.exit(0)',
+    ]);
+    assert.strictEqual(result.code, 0);
+  });
+
+  test('accepts empty object config', async () => {
+    const result = await spawnPromisified(process.execPath, [
+      '--experimental-config-file',
+      fixtures.path('rc/empty-object.json'),
+      '-e', 'process.exit(0)',
+    ]);
     assert.strictEqual(result.code, 0);
   });
 });
