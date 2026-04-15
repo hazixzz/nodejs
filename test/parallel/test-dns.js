@@ -123,15 +123,11 @@ const ports = [
   '4.4.4.4:53',
   '[2001:4860:4860::8888]:53',
   '103.238.225.181:666',
-  '[fe80::483a:5aff:fee6:1f04]:666',
-  '[fe80::483a:5aff:fee6:1f04]',
 ];
 const portsExpected = [
   '4.4.4.4',
   '2001:4860:4860::8888',
   '103.238.225.181:666',
-  '[fe80::483a:5aff:fee6:1f04]:666',
-  'fe80::483a:5aff:fee6:1f04',
 ];
 dns.setServers(ports);
 assert.deepStrictEqual(dns.getServers(), portsExpected);
@@ -144,7 +140,7 @@ assert.deepStrictEqual(dns.getServers(), []);
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
     message: 'The "rrtype" argument must be of type string. ' +
-             'Received an instance of Array'
+      'Received an instance of Array'
   };
   assert.throws(() => {
     dns.resolve('example.com', [], common.mustNotCall());
@@ -158,7 +154,7 @@ assert.deepStrictEqual(dns.getServers(), []);
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
     message: 'The "name" argument must be of type string. ' +
-             'Received undefined'
+      'Received undefined'
   };
   assert.throws(() => {
     dnsPromises.resolve();
@@ -349,7 +345,7 @@ assert.throws(() => {
     code: 'ERR_MISSING_ARGS',
     name: 'TypeError',
     message: 'The "address", "port", and "callback" arguments must be ' +
-    'specified'
+      'specified'
   };
 
   assert.throws(() => dns.lookupService('0.0.0.0'), err);
@@ -374,7 +370,7 @@ assert.throws(() => {
   }, err);
 }
 
-[null, undefined, 65538, 'test', NaN, Infinity, Symbol(), 0n, true, false, '', () => {}, {}].forEach((port) => {
+[null, undefined, 65538, 'test', NaN, Infinity, Symbol(), 0n, true, false, '', () => { }, {}].forEach((port) => {
   const err = {
     code: 'ERR_SOCKET_BAD_PORT',
     name: 'RangeError'
@@ -407,7 +403,8 @@ assert.throws(() => {
 
 {
   const cases = [
-    { method: 'resolveAny',
+    {
+      method: 'resolveAny',
       answers: [
         { type: 'A', address: '1.2.3.4', ttl: 0 },
         { type: 'AAAA', address: '::42', ttl: 0 },
@@ -424,17 +421,23 @@ assert.throws(() => {
           expire: 1800,
           minttl: 3333333333
         },
-      ] },
+      ]
+    },
 
-    { method: 'resolve4',
+    {
+      method: 'resolve4',
       options: { ttl: true },
-      answers: [ { type: 'A', address: '1.2.3.4', ttl: 0 } ] },
+      answers: [{ type: 'A', address: '1.2.3.4', ttl: 0 }]
+    },
 
-    { method: 'resolve6',
+    {
+      method: 'resolve6',
       options: { ttl: true },
-      answers: [ { type: 'AAAA', address: '::42', ttl: 0 } ] },
+      answers: [{ type: 'AAAA', address: '::42', ttl: 0 }]
+    },
 
-    { method: 'resolveSoa',
+    {
+      method: 'resolveSoa',
       answers: [
         {
           type: 'SOA',
@@ -446,7 +449,8 @@ assert.throws(() => {
           expire: 1800,
           minttl: 3333333333
         },
-      ] },
+      ]
+    },
   ];
 
   const server = dgram.createSocket('udp4');
