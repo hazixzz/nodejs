@@ -462,6 +462,11 @@ For pull requests introducing new core modules:
 * Land only after sign-off from at least two TSC voting members.
 * Land with a [Stability Index][] of Experimental. The module must remain
   Experimental until a semver-major release.
+* Introducing an Experimental feature means taking ownership of the experiment
+  and committing to a clear outcome: either promoting it to stable or removing
+  it in a timely manner. Because experimental features can be vulnerable to
+  security issues, the author is also expected to help assess and patch
+  vulnerabilities.
 
 ### Introducing new APIs on the global scope
 

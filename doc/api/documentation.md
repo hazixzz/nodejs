@@ -47,6 +47,14 @@ The stability indexes are as follows:
 >
 > Experimental features leave the experimental status typically either by
 > graduating to stable, or are removed without a deprecation cycle.
+>
+> Collaborators who introduce experimental modules are expected to take
+> ownership and drive each experiment in a timely manner to a clear outcome:
+> either promotion to stable or removal.
+>
+> If an experimental feature has reached mainstream adoption such that breaking
+> changes are not realistically possible without ecosystem breakage, it should
+> be considered stable and either be promoted or be removed after a deprecation cycle.
 
 <!-- separator -->
 
