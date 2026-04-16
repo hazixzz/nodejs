@@ -150,8 +150,7 @@ static std::string GetErrorSource(Isolate* isolate,
                          : 0;
   int start = message->GetStartColumn(context).FromMaybe(0);
   int end = message->GetEndColumn(context).FromMaybe(0);
-  if (start >= script_start) {
-    CHECK_GE(end, start);
+  if (start >= script_start && end >= script_start) {
     start -= script_start;
     end -= script_start;
   }
@@ -163,6 +162,7 @@ static std::string GetErrorSource(Isolate* isolate,
 
   if (start > end ||
       start < 0 ||
+      end < 0 ||
       static_cast<size_t>(end) > sourceline.size()) {
     return buf;
   }
