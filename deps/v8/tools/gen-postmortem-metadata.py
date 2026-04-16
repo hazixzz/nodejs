@@ -303,12 +303,12 @@ consts_misc = [
         'value': 'PropertyDetails::AttributesField::kShift'
     },
     {
-        'name': 'prop_index_mask',
-        'value': 'PropertyDetails::FieldIndexField::kMask'
+        'name': 'prop_offset_mask',
+        'value': 'PropertyDetails::OffsetInWordsField::kMask'
     },
     {
-        'name': 'prop_index_shift',
-        'value': 'PropertyDetails::FieldIndexField::kShift'
+        'name': 'prop_offset_shift',
+        'value': 'PropertyDetails::OffsetInWordsField::kShift'
     },
     {
         'name': 'prop_representation_mask',
@@ -509,7 +509,6 @@ extras_accessors = [
     'JSArrayBufferView, byte_length, size_t, kRawByteLengthOffset',
     'JSArrayBufferView, byte_offset, size_t, kRawByteOffsetOffset',
     'JSDate, value, Object, kValueOffset',
-    'JSRegExp, source, Object, kSourceOffset',
     'JSTypedArray, external_pointer, uintptr_t, kExternalPointerOffset',
     'Map, instance_size_in_words, char, kInstanceSizeInWordsOffset',
     'Map, inobject_properties_start_or_constructor_function_index, char, kInobjectPropertiesStartOrConstructorFunctionIndexOffset',
