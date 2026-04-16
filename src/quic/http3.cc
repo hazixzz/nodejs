@@ -11,6 +11,7 @@
 #include <node_http_common-inl.h>
 #include <node_sockaddr-inl.h>
 #include <util-inl.h>
+#include <zlib.h>
 #include "application.h"
 #include "bindingdata.h"
 #include "defs.h"
@@ -24,6 +25,62 @@ using v8::Array;
 using v8::Local;
 
 namespace quic {
+
+namespace {
+constexpr uint8_t kSessionTicketAppDataVersion = 1;
+constexpr size_t kSessionTicketAppDataSize = 39;
+constexpr size_t kSessionTicketAppDataHeaderSize = 5;
+constexpr size_t kSessionTicketAppDataPayloadSize =
+    kSessionTicketAppDataSize - kSessionTicketAppDataHeaderSize;
+
+inline void WriteBE32(uint8_t* buf, uint32_t val) {
+  buf[0] = static_cast<uint8_t>((val >> 24) & 0xff);
+  buf[1] = static_cast<uint8_t>((val >> 16) & 0xff);
+  buf[2] = static_cast<uint8_t>((val >> 8) & 0xff);
+  buf[3] = static_cast<uint8_t>(val & 0xff);
+}
+
+inline uint32_t ReadBE32(const uint8_t* buf) {
+  return (static_cast<uint32_t>(buf[0]) << 24) |
+         (static_cast<uint32_t>(buf[1]) << 16) |
+         (static_cast<uint32_t>(buf[2]) << 8) | static_cast<uint32_t>(buf[3]);
+}
+
+inline void WriteBE64(uint8_t* buf, uint64_t val) {
+  buf[0] = static_cast<uint8_t>((val >> 56) & 0xff);
+  buf[1] = static_cast<uint8_t>((val >> 48) & 0xff);
+  buf[2] = static_cast<uint8_t>((val >> 40) & 0xff);
+  buf[3] = static_cast<uint8_t>((val >> 32) & 0xff);
+  buf[4] = static_cast<uint8_t>((val >> 24) & 0xff);
+  buf[5] = static_cast<uint8_t>((val >> 16) & 0xff);
+  buf[6] = static_cast<uint8_t>((val >> 8) & 0xff);
+  buf[7] = static_cast<uint8_t>(val & 0xff);
+}
+
+inline uint64_t ReadBE64(const uint8_t* buf) {
+  return (static_cast<uint64_t>(buf[0]) << 56) |
+         (static_cast<uint64_t>(buf[1]) << 48) |
+         (static_cast<uint64_t>(buf[2]) << 40) |
+         (static_cast<uint64_t>(buf[3]) << 32) |
+         (static_cast<uint64_t>(buf[4]) << 24) |
+         (static_cast<uint64_t>(buf[5]) << 16) |
+         (static_cast<uint64_t>(buf[6]) << 8) | static_cast<uint64_t>(buf[7]);
+}
+
+// Serialize an nghttp3_pri into an RFC 9218 priority field value
+// (e.g., "u=3" or "u=0, i"). Returns the number of bytes written.
+// This is used only for setting the priority field of HTTP/3 streams on
+// the client side.
+inline size_t FormatPriority(char* buf, size_t buflen, const nghttp3_pri& pri) {
+  int len;
+  if (pri.inc) {
+    len = snprintf(buf, buflen, "u=%d, i", pri.urgency);
+  } else {
+    len = snprintf(buf, buflen, "u=%d", pri.urgency);
+  }
+  return static_cast<size_t>(len);
+}
+}  // namespace
 
 struct Http3HeadersTraits {
   using nv_t = nghttp3_nv;
@@ -87,7 +144,14 @@ class Http3ApplicationImpl final : public Session::Application {
       : Application(session, options),
         allocator_(BindingData::Get(env())),
         options_(options),
-        conn_(InitializeConnection()) {
+        conn_(nullptr) {
+    // Build the ORIGIN frame payload from the SNI configuration before
+    // creating the nghttp3 connection, since InitializeConnection needs
+    // the origin_vec_ to be ready for settings.origin_list.
+    if (session->is_server()) {
+      BuildOriginPayload();
+    }
+    conn_ = InitializeConnection();
     session->set_priority_supported();
   }
 
@@ -96,6 +160,8 @@ class Http3ApplicationImpl final : public Session::Application {
   }
 
   error_code GetNoErrorCode() const override { return NGHTTP3_H3_NO_ERROR; }
+
+  bool SupportsHeaders() const override { return true; }
 
   bool Start() override {
     CHECK(!started_);
@@ -158,6 +224,10 @@ class Http3ApplicationImpl final : public Session::Application {
     return ret;
   }
 
+  void BeginShutdown() override { nghttp3_conn_submit_shutdown_notice(*this); }
+
+  void CompleteShutdown() override { nghttp3_conn_shutdown(*this); }
+
   bool ReceiveStreamData(int64_t stream_id,
                          const uint8_t* data,
                          size_t datalen,
@@ -170,8 +240,8 @@ class Http3ApplicationImpl final : public Session::Application {
           stream_id,
           flags.fin);
 
-    ssize_t nread = nghttp3_conn_read_stream(
-        *this, stream_id, data, datalen, flags.fin ? 1 : 0);
+    auto nread = nghttp3_conn_read_stream2(
+        *this, stream_id, data, datalen, flags.fin ? 1 : 0, uv_hrtime());
 
     if (nread < 0) {
       Debug(&session(),
@@ -259,20 +329,65 @@ class Http3ApplicationImpl final : public Session::Application {
 
   void CollectSessionTicketAppData(
       SessionTicket::AppData* app_data) const override {
-    // TODO(@jasnell): When HTTP/3 settings become dynamic or
-    // configurable per-connection, store them here so they can be
-    // validated on 0-RTT resumption. Candidates include:
-    // max_field_section_size, qpack_max_dtable_capacity,
-    // qpack_encoder_max_dtable_capacity, qpack_blocked_streams,
-    // enable_connect_protocol, and enable_datagrams. On extraction,
-    // compare stored values against current settings and return
-    // TICKET_IGNORE_RENEW if incompatible.
+    uint8_t buf[kSessionTicketAppDataSize];
+    buf[0] = kSessionTicketAppDataVersion;
+
+    uint8_t* payload = buf + kSessionTicketAppDataHeaderSize;
+    WriteBE64(payload, options_.max_field_section_size);
+    WriteBE64(payload + 8, options_.qpack_max_dtable_capacity);
+    WriteBE64(payload + 16, options_.qpack_encoder_max_dtable_capacity);
+    WriteBE64(payload + 24, options_.qpack_blocked_streams);
+    payload[32] = options_.enable_connect_protocol ? 1 : 0;
+    payload[33] = options_.enable_datagrams ? 1 : 0;
+
+    uLong crc = crc32(0L, Z_NULL, 0);
+    crc = crc32(crc, payload, kSessionTicketAppDataPayloadSize);
+    WriteBE32(buf + 1, static_cast<uint32_t>(crc));
+
+    app_data->Set(
+        uv_buf_init(reinterpret_cast<char*>(buf), kSessionTicketAppDataSize));
   }
 
   SessionTicket::AppData::Status ExtractSessionTicketAppData(
       const SessionTicket::AppData& app_data,
       SessionTicket::AppData::Source::Flag flag) override {
-    // See CollectSessionTicketAppData above.
+    auto data = app_data.Get();
+    if (!data || data->len != kSessionTicketAppDataSize) {
+      return SessionTicket::AppData::Status::TICKET_IGNORE_RENEW;
+    }
+
+    const uint8_t* buf = reinterpret_cast<const uint8_t*>(data->base);
+
+    if (buf[0] != kSessionTicketAppDataVersion) {
+      return SessionTicket::AppData::Status::TICKET_IGNORE_RENEW;
+    }
+
+    const uint8_t* payload = buf + kSessionTicketAppDataHeaderSize;
+    uint32_t stored_crc = ReadBE32(buf + 1);
+    uLong computed_crc = crc32(0L, Z_NULL, 0);
+    computed_crc =
+        crc32(computed_crc, payload, kSessionTicketAppDataPayloadSize);
+    if (stored_crc != static_cast<uint32_t>(computed_crc)) {
+      return SessionTicket::AppData::Status::TICKET_IGNORE_RENEW;
+    }
+
+    uint64_t stored_max_field_section_size = ReadBE64(payload);
+    uint64_t stored_qpack_max_dtable_capacity = ReadBE64(payload + 8);
+    uint64_t stored_qpack_encoder_max_dtable_capacity = ReadBE64(payload + 16);
+    uint64_t stored_qpack_blocked_streams = ReadBE64(payload + 24);
+    bool stored_enable_connect_protocol = payload[32] != 0;
+    bool stored_enable_datagrams = payload[33] != 0;
+
+    if (options_.max_field_section_size < stored_max_field_section_size ||
+        options_.qpack_max_dtable_capacity < stored_qpack_max_dtable_capacity ||
+        options_.qpack_encoder_max_dtable_capacity <
+            stored_qpack_encoder_max_dtable_capacity ||
+        options_.qpack_blocked_streams < stored_qpack_blocked_streams ||
+        (stored_enable_connect_protocol && !options_.enable_connect_protocol) ||
+        (stored_enable_datagrams && !options_.enable_datagrams)) {
+      return SessionTicket::AppData::Status::TICKET_IGNORE_RENEW;
+    }
+
     return flag == SessionTicket::AppData::Source::Flag::STATUS_RENEW
                ? SessionTicket::AppData::Status::TICKET_USE_RENEW
                : SessionTicket::AppData::Status::TICKET_USE;
@@ -398,7 +513,7 @@ class Http3ApplicationImpl final : public Session::Application {
                          StreamPriority priority,
                          StreamPriorityFlags flags) override {
     nghttp3_pri pri;
-    pri.inc = (flags == StreamPriorityFlags::NON_INCREMENTAL) ? 0 : 1;
+    pri.inc = (flags == StreamPriorityFlags::INCREMENTAL) ? 1 : 0;
     switch (priority) {
       case StreamPriority::HIGH:
         pri.urgency = NGHTTP3_URGENCY_HIGH;
@@ -412,33 +527,44 @@ class Http3ApplicationImpl final : public Session::Application {
     }
     if (session().is_server()) {
       nghttp3_conn_set_server_stream_priority(*this, stream.id(), &pri);
+    } else {
+      // The client API takes a serialized RFC 9218 priority field value
+      // (e.g., "u=0, i") rather than an nghttp3_pri struct.
+      char buf[8];
+      size_t len = FormatPriority(buf, sizeof(buf), pri);
+      nghttp3_conn_set_client_stream_priority(
+          *this, stream.id(), reinterpret_cast<const uint8_t*>(buf), len);
     }
-    // Client-side priority is set at request submission time via
-    // nghttp3_conn_submit_request and is not typically changed
-    // after the fact. The client API takes a serialized RFC 9218
-    // field value rather than an nghttp3_pri struct.
   }
 
-  StreamPriority GetStreamPriority(const Stream& stream) override {
+  StreamPriorityResult GetStreamPriority(const Stream& stream) override {
+    // nghttp3_conn_get_stream_priority is only available on the server
+    // side, where it reflects the peer's requested priority (e.g., from
+    // PRIORITY_UPDATE frames). Client-side priority is tracked by the
+    // Stream itself and returned directly from GetPriority in streams.cc.
+    if (!session().is_server()) {
+      auto& stored = stream.stored_priority();
+      return {stored.priority, stored.flags};
+    }
     nghttp3_pri pri;
     if (nghttp3_conn_get_stream_priority(*this, &pri, stream.id()) == 0) {
-      // TODO(@jasnell): The nghttp3_pri.inc (incremental) flag is
-      // not yet exposed. When priority-based stream scheduling is
-      // implemented, GetStreamPriority should return both urgency
-      // and the incremental flag (making get/set symmetrical).
-      // The inc flag determines whether the server should interleave
-      // data from this stream with others of the same urgency
-      // (inc=1) or complete it first (inc=0).
+      StreamPriority level;
       switch (pri.urgency) {
         case NGHTTP3_URGENCY_HIGH:
-          return StreamPriority::HIGH;
+          level = StreamPriority::HIGH;
+          break;
         case NGHTTP3_URGENCY_LOW:
-          return StreamPriority::LOW;
+          level = StreamPriority::LOW;
+          break;
         default:
-          return StreamPriority::DEFAULT;
+          level = StreamPriority::DEFAULT;
+          break;
       }
+      return {level,
+              pri.inc ? StreamPriorityFlags::INCREMENTAL
+                      : StreamPriorityFlags::NON_INCREMENTAL};
     }
-    return StreamPriority::DEFAULT;
+    return {StreamPriority::DEFAULT, StreamPriorityFlags::NON_INCREMENTAL};
   }
 
   int GetStreamData(StreamData* data) override {
@@ -494,9 +620,38 @@ class Http3ApplicationImpl final : public Session::Application {
            id == qpack_enc_stream_id_;
   }
 
+  void BuildOriginPayload() {
+    // Build the serialized ORIGIN frame payload from the SNI configuration.
+    // Each origin entry is: 2-byte BE length + origin string.
+    // Wildcard ('*') entries and entries with authoritative=false are skipped.
+    auto& sni = session().config().options.sni;
+    for (auto& [hostname, opts] : sni) {
+      if (hostname == "*" || !opts.authoritative) continue;
+      std::string origin = "https://";
+      origin += hostname;
+      if (opts.port != 443) {
+        origin += ":";
+        origin += std::to_string(opts.port);
+      }
+      // 2-byte BE length prefix
+      uint16_t len = static_cast<uint16_t>(origin.size());
+      origin_payload_.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+      origin_payload_.push_back(static_cast<uint8_t>(len & 0xff));
+      // Origin string bytes
+      origin_payload_.insert(
+          origin_payload_.end(), origin.begin(), origin.end());
+    }
+    if (!origin_payload_.empty()) {
+      origin_vec_ = {origin_payload_.data(), origin_payload_.size()};
+    }
+  }
+
   Http3ConnectionPointer InitializeConnection() {
     nghttp3_conn* conn = nullptr;
     nghttp3_settings settings = options_;
+    if (!origin_payload_.empty()) {
+      settings.origin_list = &origin_vec_;
+    }
     if (session().is_server()) {
       CHECK_EQ(nghttp3_conn_server_new(
                    &conn, &kCallbacks, &settings, &allocator_, this),
@@ -523,8 +678,7 @@ class Http3ApplicationImpl final : public Session::Application {
   }
 
   void OnBeginHeaders(int64_t stream_id) {
-    auto stream = session().FindStream(stream_id);
-    // If the stream does not exist or is destroyed, ignore!
+    auto stream = FindOrCreateStream(conn_.get(), &session(), stream_id);
     if (!stream) [[unlikely]]
       return;
     Debug(&session(),
@@ -574,7 +728,7 @@ class Http3ApplicationImpl final : public Session::Application {
   }
 
   void OnBeginTrailers(int64_t stream_id) {
-    auto stream = session().FindStream(stream_id);
+    auto stream = FindOrCreateStream(conn_.get(), &session(), stream_id);
     if (!stream) [[unlikely]]
       return;
     Debug(&session(),
@@ -665,13 +819,11 @@ class Http3ApplicationImpl final : public Session::Application {
     session().Close(Session::CloseMethod::GRACEFUL);
   }
 
-  void OnReceiveSettings(const nghttp3_settings* settings) {
+  void OnReceiveSettings(const nghttp3_proto_settings* settings) {
     options_.enable_connect_protocol = settings->enable_connect_protocol;
     options_.enable_datagrams = settings->h3_datagram;
     options_.max_field_section_size = settings->max_field_section_size;
     options_.qpack_blocked_streams = settings->qpack_blocked_streams;
-    options_.qpack_encoder_max_dtable_capacity =
-        settings->qpack_encoder_max_dtable_capacity;
     options_.qpack_max_dtable_capacity = settings->qpack_max_dtable_capacity;
     Debug(&session(),
           "HTTP/3 application received updated settings: %s",
@@ -685,6 +837,14 @@ class Http3ApplicationImpl final : public Session::Application {
   int64_t control_stream_id_ = -1;
   int64_t qpack_dec_stream_id_ = -1;
   int64_t qpack_enc_stream_id_ = -1;
+
+  // ORIGIN frame support (RFC 9412).
+  // origin_payload_ holds the serialized ORIGIN frame payload for sending.
+  // origin_vec_ points into origin_payload_ for nghttp3_settings.origin_list.
+  // received_origins_ accumulates origins from received ORIGIN frames.
+  std::vector<uint8_t> origin_payload_;
+  nghttp3_vec origin_vec_{nullptr, 0};
+  std::vector<std::string> received_origins_;
 
   // ==========================================================================
   // Static callbacks
@@ -955,7 +1115,7 @@ class Http3ApplicationImpl final : public Session::Application {
   }
 
   static int on_receive_settings(nghttp3_conn* conn,
-                                 const nghttp3_settings* settings,
+                                 const nghttp3_proto_settings* settings,
                                  void* conn_user_data) {
     NGHTTP3_CALLBACK_SCOPE(app);
     app.OnReceiveSettings(settings);
@@ -966,14 +1126,18 @@ class Http3ApplicationImpl final : public Session::Application {
                                const uint8_t* origin,
                                size_t originlen,
                                void* conn_user_data) {
-    // ORIGIN frames (RFC 8336) are used for connection coalescing
-    // across multiple origins. Not yet implemented u2014 requires
-    // connection pooling and multi-origin reuse support.
+    NGHTTP3_CALLBACK_SCOPE(app);
+    app.received_origins_.emplace_back(reinterpret_cast<const char*>(origin),
+                                       originlen);
     return NGTCP2_SUCCESS;
   }
 
   static int on_end_origin(nghttp3_conn* conn, void* conn_user_data) {
-    // See on_receive_origin above.
+    NGHTTP3_CALLBACK_SCOPE(app);
+    if (!app.received_origins_.empty()) {
+      app.session().EmitOrigins(std::move(app.received_origins_));
+      app.received_origins_.clear();
+    }
     return NGTCP2_SUCCESS;
   }
 
@@ -981,25 +1145,26 @@ class Http3ApplicationImpl final : public Session::Application {
     CHECK(ncrypto::CSPRNG(dest, destlen));
   }
 
-  static constexpr nghttp3_callbacks kCallbacks = {on_acked_stream_data,
-                                                   on_stream_close,
-                                                   on_receive_data,
-                                                   on_deferred_consume,
-                                                   on_begin_headers,
-                                                   on_receive_header,
-                                                   on_end_headers,
-                                                   on_begin_trailers,
-                                                   on_receive_trailer,
-                                                   on_end_trailers,
-                                                   on_stop_sending,
-                                                   on_end_stream,
-                                                   on_reset_stream,
-                                                   on_shutdown,
-                                                   on_receive_settings,
-                                                   on_receive_origin,
-                                                   on_end_origin,
-                                                   on_rand,
-                                                   nullptr};
+  static constexpr nghttp3_callbacks kCallbacks = {
+      on_acked_stream_data,
+      on_stream_close,
+      on_receive_data,
+      on_deferred_consume,
+      on_begin_headers,
+      on_receive_header,
+      on_end_headers,
+      on_begin_trailers,
+      on_receive_trailer,
+      on_end_trailers,
+      on_stop_sending,
+      on_end_stream,
+      on_reset_stream,
+      on_shutdown,
+      nullptr,  // recv_settings (deprecated)
+      on_receive_origin,
+      on_end_origin,
+      on_rand,
+      on_receive_settings};
 };
 
 std::unique_ptr<Session::Application> CreateHttp3Application(

@@ -8,55 +8,49 @@ if (!hasQuic) {
   skip('QUIC is not enabled');
 }
 
-// Import after the hasQuic check
 const { listen, connect } = await import('node:quic');
 const { createPrivateKey } = await import('node:crypto');
 
 const key = createPrivateKey(fixtures.readKey('agent1-key.pem'));
 const cert = fixtures.readKey('agent1-cert.pem');
 
-const check = {
-  // The SNI value
-  servername: 'localhost',
-  // The selected ALPN protocol
-  protocol: 'quic-test',
-  // The negotiated cipher suite
-  cipher: 'TLS_AES_128_GCM_SHA256',
-  cipherVersion: 'TLSv1.3',
-  // No session ticket provided, so early data was not attempted
-  earlyDataAttempted: false,
-  earlyDataAccepted: false,
-};
+// rejectUnauthorized must be a boolean
+await assert.rejects(connect({ port: 1234 }, {
+  alpn: 'quic-test',
+  rejectUnauthorized: 'yes',
+}), {
+  code: 'ERR_INVALID_ARG_TYPE',
+});
 
-// The opened promise should resolve when the handshake is complete.
+// With rejectUnauthorized: true (the default), connecting with self-signed
+// certs and no CA should produce a validation error in the handshake info.
 
 const serverOpened = Promise.withResolvers();
 const clientOpened = Promise.withResolvers();
 
 const serverEndpoint = await listen(mustCall((serverSession) => {
-  serverSession.opened.then((info) => {
-    assert.partialDeepStrictEqual(info, check);
+  serverSession.opened.then(mustCall((info) => {
     serverOpened.resolve();
     serverSession.close();
-  }).then(mustCall());
+  }));
 }), {
   sni: { '*': { keys: [key], certs: [cert] } },
   alpn: ['quic-test'],
 });
 
-// Buffer is not detached.
-assert.strictEqual(cert.buffer.detached, false);
-
-// The server must have an address to connect to after listen resolves.
-assert.ok(serverEndpoint.address !== undefined);
-
 const clientSession = await connect(serverEndpoint.address, {
   alpn: 'quic-test',
+  servername: 'localhost',
+  // Default: rejectUnauthorized: true
 });
-clientSession.opened.then((info) => {
-  assert.partialDeepStrictEqual(info, check);
+clientSession.opened.then(mustCall((info) => {
+  // Self-signed cert without CA should produce a validation error.
+  assert.strictEqual(typeof info.validationErrorReason, 'string');
+  assert.ok(info.validationErrorReason.length > 0);
+  assert.strictEqual(typeof info.validationErrorCode, 'string');
+  assert.ok(info.validationErrorCode.length > 0);
   clientOpened.resolve();
-}).then(mustCall());
+}));
 
 await Promise.all([serverOpened.promise, clientOpened.promise]);
 clientSession.close();

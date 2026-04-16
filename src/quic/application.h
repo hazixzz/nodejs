@@ -113,18 +113,37 @@ class Session::Application : public MemoryRetainer {
   // pending session and stream packets it has accumulated.
   void SendPendingData();
 
+  // Returns true if the application protocol supports sending and
+  // receiving headers on streams (e.g. HTTP/3). Applications that
+  // do not support headers should return false (the default).
+  virtual bool SupportsHeaders() const;
+
+  // Initiates application-level graceful shutdown signaling (e.g.,
+  // HTTP/3 GOAWAY). Called when Session::Close(GRACEFUL) is invoked.
+  virtual void BeginShutdown();
+
+  // Completes the application-level graceful shutdown. Called from
+  // FinishClose() before CONNECTION_CLOSE is sent. For HTTP/3, this
+  // sends the final GOAWAY with the actual last accepted stream ID.
+  virtual void CompleteShutdown();
+
   // Set the priority level of the stream if supported by the application. Not
   // all applications support priorities, in which case this function is a
   // non-op.
   virtual void SetStreamPriority(
       const Stream& stream,
       StreamPriority priority = StreamPriority::DEFAULT,
-      StreamPriorityFlags flags = StreamPriorityFlags::NONE);
+      StreamPriorityFlags flags = StreamPriorityFlags::NON_INCREMENTAL);
+
+  struct StreamPriorityResult {
+    StreamPriority priority;
+    StreamPriorityFlags flags;
+  };
 
   // Get the priority level of the stream if supported by the application. Not
   // all applications support priorities, in which case this function returns
   // the default stream priority.
-  virtual StreamPriority GetStreamPriority(const Stream& stream);
+  virtual StreamPriorityResult GetStreamPriority(const Stream& stream);
 
   struct StreamData;
 

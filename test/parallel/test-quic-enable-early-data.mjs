@@ -8,55 +8,48 @@ if (!hasQuic) {
   skip('QUIC is not enabled');
 }
 
-// Import after the hasQuic check
 const { listen, connect } = await import('node:quic');
 const { createPrivateKey } = await import('node:crypto');
 
 const key = createPrivateKey(fixtures.readKey('agent1-key.pem'));
 const cert = fixtures.readKey('agent1-cert.pem');
 
-const check = {
-  // The SNI value
-  servername: 'localhost',
-  // The selected ALPN protocol
-  protocol: 'quic-test',
-  // The negotiated cipher suite
-  cipher: 'TLS_AES_128_GCM_SHA256',
-  cipherVersion: 'TLSv1.3',
-  // No session ticket provided, so early data was not attempted
-  earlyDataAttempted: false,
-  earlyDataAccepted: false,
-};
+// enableEarlyData must be a boolean
+await assert.rejects(connect({ port: 1234 }, {
+  alpn: 'quic-test',
+  enableEarlyData: 'yes',
+}), {
+  code: 'ERR_INVALID_ARG_TYPE',
+});
 
-// The opened promise should resolve when the handshake is complete.
+// With enableEarlyData: false, early data should not be attempted.
+// (Without a session ticket, early data is never attempted regardless,
+// but this verifies the option is functional and passes through to C++.)
 
 const serverOpened = Promise.withResolvers();
 const clientOpened = Promise.withResolvers();
 
 const serverEndpoint = await listen(mustCall((serverSession) => {
-  serverSession.opened.then((info) => {
-    assert.partialDeepStrictEqual(info, check);
+  serverSession.opened.then(mustCall((info) => {
     serverOpened.resolve();
     serverSession.close();
-  }).then(mustCall());
+  }));
 }), {
   sni: { '*': { keys: [key], certs: [cert] } },
   alpn: ['quic-test'],
+  enableEarlyData: false,
 });
-
-// Buffer is not detached.
-assert.strictEqual(cert.buffer.detached, false);
-
-// The server must have an address to connect to after listen resolves.
-assert.ok(serverEndpoint.address !== undefined);
 
 const clientSession = await connect(serverEndpoint.address, {
   alpn: 'quic-test',
+  servername: 'localhost',
+  enableEarlyData: false,
 });
-clientSession.opened.then((info) => {
-  assert.partialDeepStrictEqual(info, check);
+clientSession.opened.then(mustCall((info) => {
+  assert.strictEqual(info.earlyDataAttempted, false);
+  assert.strictEqual(info.earlyDataAccepted, false);
   clientOpened.resolve();
-}).then(mustCall());
+}));
 
 await Promise.all([serverOpened.promise, clientOpened.promise]);
 clientSession.close();

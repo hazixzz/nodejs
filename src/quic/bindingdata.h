@@ -41,12 +41,14 @@ class Packet;
   V(session_handshake, SessionHandshake)                                       \
   V(session_new, SessionNew)                                                   \
   V(session_new_token, SessionNewToken)                                        \
+  V(session_origin, SessionOrigin)                                             \
   V(session_path_validation, SessionPathValidation)                            \
   V(session_ticket, SessionTicket)                                             \
   V(session_version_negotiation, SessionVersionNegotiation)                    \
   V(stream_blocked, StreamBlocked)                                             \
   V(stream_close, StreamClose)                                                 \
   V(stream_created, StreamCreated)                                             \
+  V(stream_drain, StreamDrain)                                                 \
   V(stream_headers, StreamHeaders)                                             \
   V(stream_reset, StreamReset)                                                 \
   V(stream_trailers, StreamTrailers)
@@ -59,6 +61,7 @@ class Packet;
   V(active_connection_id_limit, "activeConnectionIDLimit")                     \
   V(address_lru_size, "addressLRUSize")                                        \
   V(application, "application")                                                \
+  V(authoritative, "authoritative")                                            \
   V(bbr, "bbr")                                                                \
   V(ca, "ca")                                                                  \
   V(cc_algorithm, "cc")                                                        \
@@ -77,6 +80,7 @@ class Packet;
   V(groups, "groups")                                                          \
   V(handshake_timeout, "handshakeTimeout")                                     \
   V(http3_alpn, &NGHTTP3_ALPN_H3[1])                                           \
+  V(keep_alive_timeout, "keepAlive")                                           \
   V(initial_max_data, "initialMaxData")                                        \
   V(initial_max_stream_data_bidi_local, "initialMaxStreamDataBidiLocal")       \
   V(initial_max_stream_data_bidi_remote, "initialMaxStreamDataBidiRemote")     \
@@ -102,6 +106,7 @@ class Packet;
   V(max_stream_window, "maxStreamWindow")                                      \
   V(max_window, "maxWindow")                                                   \
   V(min_version, "minVersion")                                                 \
+  V(port, "port")                                                              \
   V(preferred_address_strategy, "preferredAddressPolicy")                      \
   V(alpn, "alpn")                                                              \
   V(qlog, "qlog")                                                              \

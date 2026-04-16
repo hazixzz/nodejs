@@ -57,11 +57,44 @@ using v8::Value;
 
 namespace quic {
 
+// Listener flags are packed into a single uint32_t bitfield to reduce
+// the size of the shared state buffer. Each bit indicates whether a
+// corresponding JS callback is registered.
+enum class SessionListenerFlags : uint32_t {
+  PATH_VALIDATION = 1 << 0,
+  DATAGRAM = 1 << 1,
+  DATAGRAM_STATUS = 1 << 2,
+  SESSION_TICKET = 1 << 3,
+  NEW_TOKEN = 1 << 4,
+  ORIGIN = 1 << 5,
+};
+
+inline SessionListenerFlags operator|(SessionListenerFlags a,
+                                      SessionListenerFlags b) {
+  return static_cast<SessionListenerFlags>(static_cast<uint32_t>(a) |
+                                           static_cast<uint32_t>(b));
+}
+
+inline SessionListenerFlags operator&(SessionListenerFlags a,
+                                      SessionListenerFlags b) {
+  return static_cast<SessionListenerFlags>(static_cast<uint32_t>(a) &
+                                           static_cast<uint32_t>(b));
+}
+
+inline SessionListenerFlags operator&(uint32_t a, SessionListenerFlags b) {
+  return static_cast<SessionListenerFlags>(a & static_cast<uint32_t>(b));
+}
+
+inline bool operator!(SessionListenerFlags a) {
+  return static_cast<uint32_t>(a) == 0;
+}
+
+inline bool HasListenerFlag(uint32_t flags, SessionListenerFlags flag) {
+  return !!(flags & flag);
+}
+
 #define SESSION_STATE(V)                                                       \
-  V(PATH_VALIDATION, path_validation, uint8_t)                                 \
-  V(VERSION_NEGOTIATION, version_negotiation, uint8_t)                         \
-  V(DATAGRAM, datagram, uint8_t)                                               \
-  V(SESSION_TICKET, session_ticket, uint8_t)                                   \
+  V(LISTENER_FLAGS, listener_flags, uint32_t)                                  \
   V(CLOSING, closing, uint8_t)                                                 \
   V(GRACEFUL_CLOSE, graceful_close, uint8_t)                                   \
   V(SILENT_CLOSE, silent_close, uint8_t)                                       \
@@ -70,8 +103,10 @@ namespace quic {
   V(HANDSHAKE_CONFIRMED, handshake_confirmed, uint8_t)                         \
   V(STREAM_OPEN_ALLOWED, stream_open_allowed, uint8_t)                         \
   V(PRIORITY_SUPPORTED, priority_supported, uint8_t)                           \
+  V(HEADERS_SUPPORTED, headers_supported, uint8_t)                             \
   V(WRAPPED, wrapped, uint8_t)                                                 \
   V(APPLICATION_TYPE, application_type, uint8_t)                               \
+  V(MAX_DATAGRAM_SIZE, max_datagram_size, uint64_t)                            \
   V(LAST_DATAGRAM_ID, last_datagram_id, datagram_id)
 
 #define SESSION_STATS(V)                                                       \
@@ -80,7 +115,6 @@ namespace quic {
   V(HANDSHAKE_COMPLETED_AT, handshake_completed_at)                            \
   V(HANDSHAKE_CONFIRMED_AT, handshake_confirmed_at)                            \
   V(BYTES_RECEIVED, bytes_received)                                            \
-  V(BYTES_SENT, bytes_sent)                                                    \
   V(BIDI_IN_STREAM_COUNT, bidi_in_stream_count)                                \
   V(BIDI_OUT_STREAM_COUNT, bidi_out_stream_count)                              \
   V(UNI_IN_STREAM_COUNT, uni_in_stream_count)                                  \
@@ -94,22 +128,34 @@ namespace quic {
   V(RTTVAR, rttvar)                                                            \
   V(SMOOTHED_RTT, smoothed_rtt)                                                \
   V(SSTHRESH, ssthresh)                                                        \
+  V(PKT_SENT, pkt_sent)                                                        \
+  V(BYTES_SENT, bytes_sent)                                                    \
+  V(PKT_RECV, pkt_recv)                                                        \
+  V(BYTES_RECV, bytes_recv)                                                    \
+  V(PKT_LOST, pkt_lost)                                                        \
+  V(BYTES_LOST, bytes_lost)                                                    \
+  V(PING_RECV, ping_recv)                                                      \
+  V(PKT_DISCARDED, pkt_discarded)                                              \
   V(DATAGRAMS_RECEIVED, datagrams_received)                                    \
   V(DATAGRAMS_SENT, datagrams_sent)                                            \
   V(DATAGRAMS_ACKNOWLEDGED, datagrams_acknowledged)                            \
   V(DATAGRAMS_LOST, datagrams_lost)
 
+#define NO_SIDE_EFFECT true
+#define SIDE_EFFECT false
+
 #define SESSION_JS_METHODS(V)                                                  \
-  V(Destroy, destroy, false)                                                   \
-  V(GetRemoteAddress, getRemoteAddress, true)                                  \
-  V(GetCertificate, getCertificate, true)                                      \
-  V(GetEphemeralKeyInfo, getEphemeralKey, true)                                \
-  V(GetPeerCertificate, getPeerCertificate, true)                              \
-  V(GracefulClose, gracefulClose, false)                                       \
-  V(SilentClose, silentClose, false)                                           \
-  V(UpdateKey, updateKey, false)                                               \
-  V(OpenStream, openStream, false)                                             \
-  V(SendDatagram, sendDatagram, false)
+  V(Destroy, destroy, SIDE_EFFECT)                                             \
+  V(GetRemoteAddress, getRemoteAddress, NO_SIDE_EFFECT)                        \
+  V(GetLocalAddress, getLocalAddress, NO_SIDE_EFFECT)                          \
+  V(GetCertificate, getCertificate, NO_SIDE_EFFECT)                            \
+  V(GetEphemeralKeyInfo, getEphemeralKey, NO_SIDE_EFFECT)                      \
+  V(GetPeerCertificate, getPeerCertificate, NO_SIDE_EFFECT)                    \
+  V(GracefulClose, gracefulClose, SIDE_EFFECT)                                 \
+  V(SilentClose, silentClose, SIDE_EFFECT)                                     \
+  V(UpdateKey, updateKey, SIDE_EFFECT)                                         \
+  V(OpenStream, openStream, SIDE_EFFECT)                                       \
+  V(SendDatagram, sendDatagram, SIDE_EFFECT)
 
 struct Session::State final {
 #define V(_, name, type) type name;
@@ -208,7 +254,7 @@ void ngtcp2_debug_log(void* user_data, const char* fmt, ...) {
   va_end(ap);
 }
 
-template <typename Opt, PreferredAddress::Policy Opt::*member>
+template <typename Opt, PreferredAddress::Policy Opt::* member>
 bool SetOption(Environment* env,
                Opt* options,
                const Local<Object>& object,
@@ -223,7 +269,7 @@ bool SetOption(Environment* env,
   return true;
 }
 
-template <typename Opt, TLSContext::Options Opt::*member>
+template <typename Opt, TLSContext::Options Opt::* member>
 bool SetOption(Environment* env,
                Opt* options,
                const Local<Object>& object,
@@ -238,7 +284,7 @@ bool SetOption(Environment* env,
   return true;
 }
 
-template <typename Opt, TransportParams::Options Opt::*member>
+template <typename Opt, TransportParams::Options Opt::* member>
 bool SetOption(Environment* env,
                Opt* options,
                const Local<Object>& object,
@@ -253,7 +299,7 @@ bool SetOption(Environment* env,
   return true;
 }
 
-template <typename Opt, ngtcp2_cc_algo Opt::*member>
+template <typename Opt, ngtcp2_cc_algo Opt::* member>
 bool SetOption(Environment* env,
                Opt* options,
                const Local<Object>& object,
@@ -318,6 +364,20 @@ Session::Config::Config(Environment* env,
       ocid(ocid) {
   ngtcp2_settings_default(&settings);
   settings.initial_ts = uv_hrtime();
+
+  // Advertise all versions ngtcp2 supports for compatible version
+  // negotiation (RFC 9368). The preferred list orders the newest
+  // version first so that negotiation upgrades when possible. The
+  // initial packet version (options.version) defaults to V1 for
+  // maximum compatibility with peers that don't support version
+  // negotiation.
+  static const uint32_t kSupportedVersions[] = {NGTCP2_PROTO_VER_V2,
+                                                NGTCP2_PROTO_VER_V1};
+
+  settings.preferred_versions = kSupportedVersions;
+  settings.preferred_versionslen = std::size(kSupportedVersions);
+  settings.available_versions = kSupportedVersions;
+  settings.available_versionslen = std::size(kSupportedVersions);
 
   // TODO(@jasnell): Path MTU Discovery is disabled because libuv does not
   // currently expose the IP_DONTFRAG / IP_MTU_DISCOVER socket options
@@ -436,9 +496,9 @@ Maybe<Session::Options> Session::Options::From(Environment* env,
 
   if (!SET(version) || !SET(min_version) || !SET(preferred_address_strategy) ||
       !SET(transport_params) || !SET(tls_options) || !SET(qlog) ||
-      !SET(handshake_timeout) || !SET(max_stream_window) || !SET(max_window) ||
-      !SET(max_payload_size) || !SET(unacknowledged_packet_threshold) ||
-      !SET(cc_algorithm)) {
+      !SET(handshake_timeout) || !SET(keep_alive_timeout) ||
+      !SET(max_stream_window) || !SET(max_window) || !SET(max_payload_size) ||
+      !SET(unacknowledged_packet_threshold) || !SET(cc_algorithm)) {
     return Nothing<Options>();
   }
 
@@ -589,42 +649,6 @@ struct Session::Impl final : public MemoryRetainer {
 
   inline bool is_closing() const { return state_->closing; }
 
-  /**
-   * @returns {boolean} Returns true if the Session can be destroyed
-   * immediately.
-   */
-  bool Close() {
-    if (state_->closing) return true;
-    state_->closing = 1;
-    STAT_RECORD_TIMESTAMP(Stats, closing_at);
-
-    // Iterate through all of the known streams and close them. The streams
-    // will remove themselves from the Session as soon as they are closed.
-    // Note: we create a copy because the streams will remove themselves
-    // while they are cleaning up which will invalidate the iterator.
-    StreamsMap streams = streams_;
-    for (auto& stream : streams) stream.second->Destroy(last_error_);
-    DCHECK(streams.empty());
-
-    // Clear the pending streams.
-    while (!pending_bidi_stream_queue_.IsEmpty()) {
-      pending_bidi_stream_queue_.PopFront()->reject(last_error_);
-    }
-    while (!pending_uni_stream_queue_.IsEmpty()) {
-      pending_uni_stream_queue_.PopFront()->reject(last_error_);
-    }
-
-    // If we are able to send packets, we should try sending a connection
-    // close packet to the remote peer.
-    if (!state_->silent_close) {
-      session_->SendConnectionClose();
-    }
-
-    timer_.Close();
-
-    return !state_->wrapped;
-  }
-
   ~Impl() {
     // Ensure that Close() was called before dropping
     DCHECK(is_closing());
@@ -640,9 +664,9 @@ struct Session::Impl final : public MemoryRetainer {
         ngtcp2_conn_get_scid(*session_, nullptr));
     ngtcp2_conn_get_scid(*session_, cids.out());
 
-    MaybeStackBuffer<ngtcp2_cid_token, 10> tokens(
-        ngtcp2_conn_get_active_dcid(*session_, nullptr));
-    ngtcp2_conn_get_active_dcid(*session_, tokens.out());
+    MaybeStackBuffer<ngtcp2_cid_token2, 10> tokens(
+        ngtcp2_conn_get_active_dcid2(*session_, nullptr));
+    ngtcp2_conn_get_active_dcid2(*session_, tokens.out());
 
     endpoint->DisassociateCID(config_.dcid);
     endpoint->DisassociateCID(config_.preferred_address_cid);
@@ -654,7 +678,7 @@ struct Session::Impl final : public MemoryRetainer {
     for (size_t n = 0; n < tokens.length(); n++) {
       if (tokens[n].token_present) {
         endpoint->DisassociateStatelessResetToken(
-            StatelessResetToken(tokens[n].token));
+            StatelessResetToken(&tokens[n].token));
       }
     }
 
@@ -716,6 +740,21 @@ struct Session::Impl final : public MemoryRetainer {
     }
 
     auto address = session->remote_address();
+    args.GetReturnValue().Set(
+        SocketAddressBase::Create(env, std::make_shared<SocketAddress>(address))
+            ->object());
+  }
+
+  JS_METHOD(GetLocalAddress) {
+    auto env = Environment::GetCurrent(args);
+    Session* session;
+    ASSIGN_OR_RETURN_UNWRAP(&session, args.This());
+
+    if (session->is_destroyed()) {
+      return THROW_ERR_INVALID_STATE(env, "Session is destroyed");
+    }
+
+    auto address = session->local_address();
     args.GetReturnValue().Set(
         SocketAddressBase::Create(env, std::make_shared<SocketAddress>(address))
             ->object());
@@ -888,7 +927,7 @@ struct Session::Impl final : public MemoryRetainer {
                            ngtcp2_connection_id_status_type type,
                            uint64_t seq,
                            const ngtcp2_cid* cid,
-                           const uint8_t* token,
+                           const ngtcp2_stateless_reset_token* token,
                            void* user_data) {
     NGTCP2_CALLBACK_SCOPE(session)
     std::optional<StatelessResetToken> maybe_reset_token;
@@ -960,7 +999,7 @@ struct Session::Impl final : public MemoryRetainer {
 
   static int on_get_new_cid(ngtcp2_conn* conn,
                             ngtcp2_cid* cid,
-                            uint8_t* token,
+                            ngtcp2_stateless_reset_token* token,
                             size_t cidlen,
                             void* user_data) {
     NGTCP2_CALLBACK_SCOPE(session)
@@ -1057,7 +1096,7 @@ struct Session::Impl final : public MemoryRetainer {
   }
 
   static int on_receive_stateless_reset(ngtcp2_conn* conn,
-                                        const ngtcp2_pkt_stateless_reset* sr,
+                                        const ngtcp2_pkt_stateless_reset2* sr,
                                         void* user_data) {
     NGTCP2_CALLBACK_SCOPE(session)
     session->impl_->state_->stateless_reset = 1;
@@ -1226,12 +1265,12 @@ struct Session::Impl final : public MemoryRetainer {
       on_acknowledge_stream_data_offset,
       nullptr,
       on_stream_close,
-      on_receive_stateless_reset,
+      nullptr,  // recv_stateless_reset (deprecated, use v2 below)
       ngtcp2_crypto_recv_retry_cb,
       on_extend_max_streams_bidi,
       on_extend_max_streams_uni,
       on_rand,
-      on_get_new_cid,
+      nullptr,  // get_new_connection_id (deprecated, use v2 below)
       on_remove_connection_id,
       ngtcp2_crypto_update_key_cb,
       on_path_validation,
@@ -1240,7 +1279,7 @@ struct Session::Impl final : public MemoryRetainer {
       on_extend_max_remote_streams_bidi,
       on_extend_max_remote_streams_uni,
       on_extend_max_stream_data,
-      on_cid_status,
+      nullptr,  // dcid_status (deprecated, use v2 below)
       on_handshake_confirmed,
       on_receive_new_token,
       ngtcp2_crypto_delete_crypto_aead_ctx_cb,
@@ -1248,13 +1287,17 @@ struct Session::Impl final : public MemoryRetainer {
       on_receive_datagram,
       on_acknowledge_datagram,
       on_lost_datagram,
-      ngtcp2_crypto_get_path_challenge_data_cb,
+      nullptr,  // get_path_challenge_data (deprecated, use v2 below)
       on_stream_stop_sending,
       ngtcp2_crypto_version_negotiation_cb,
       on_receive_rx_key,
       nullptr,
       on_early_data_rejected,
-      on_begin_path_validation};
+      on_begin_path_validation,
+      on_receive_stateless_reset,
+      on_get_new_cid,
+      on_cid_status,
+      ngtcp2_crypto_get_path_challenge_data2_cb};
 
   static constexpr ngtcp2_callbacks SERVER = {
       nullptr,
@@ -1269,12 +1312,12 @@ struct Session::Impl final : public MemoryRetainer {
       on_acknowledge_stream_data_offset,
       nullptr,
       on_stream_close,
-      on_receive_stateless_reset,
+      nullptr,  // recv_stateless_reset (deprecated, use v2 below)
       nullptr,
       on_extend_max_streams_bidi,
       on_extend_max_streams_uni,
       on_rand,
-      on_get_new_cid,
+      nullptr,  // get_new_connection_id (deprecated, use v2 below)
       on_remove_connection_id,
       ngtcp2_crypto_update_key_cb,
       on_path_validation,
@@ -1283,7 +1326,7 @@ struct Session::Impl final : public MemoryRetainer {
       on_extend_max_remote_streams_bidi,
       on_extend_max_remote_streams_uni,
       on_extend_max_stream_data,
-      on_cid_status,
+      nullptr,  // dcid_status (deprecated, use v2 below)
       nullptr,
       nullptr,
       ngtcp2_crypto_delete_crypto_aead_ctx_cb,
@@ -1291,13 +1334,17 @@ struct Session::Impl final : public MemoryRetainer {
       on_receive_datagram,
       on_acknowledge_datagram,
       on_lost_datagram,
-      ngtcp2_crypto_get_path_challenge_data_cb,
+      nullptr,  // get_path_challenge_data (deprecated, use v2 below)
       on_stream_stop_sending,
       ngtcp2_crypto_version_negotiation_cb,
       nullptr,
       on_receive_tx_key,
       on_early_data_rejected,
-      on_begin_path_validation};
+      on_begin_path_validation,
+      on_receive_stateless_reset,
+      on_get_new_cid,
+      on_cid_status,
+      ngtcp2_crypto_get_path_challenge_data2_cb};
 };
 
 #undef NGTCP2_CALLBACK_SCOPE
@@ -1354,6 +1401,11 @@ Session::Session(Endpoint* endpoint,
     auto app =
         SelectApplicationFromAlpn(DecodeAlpn(config.options.tls_options.alpn));
     if (app) SetApplication(std::move(app));
+  }
+
+  if (config.options.keep_alive_timeout > 0) {
+    ngtcp2_conn_set_keep_alive_timeout(
+        *this, config.options.keep_alive_timeout * NGTCP2_MILLISECONDS);
   }
 
   MakeWeak();
@@ -1480,19 +1532,22 @@ void Session::Close(CloseMethod method) {
       return FinishClose();
     }
     case CloseMethod::GRACEFUL: {
-      // If there are no open streams, then we can close just immediately and
-      // not worry about waiting around.
-      if (impl_->streams_.empty()) {
-        impl_->state_->silent_close = 0;
-        impl_->state_->graceful_close = 0;
-        return FinishClose();
-      }
-
       // If we are already closing gracefully, do nothing.
       if (impl_->state_->graceful_close) [[unlikely]] {
         return;
       }
       impl_->state_->graceful_close = 1;
+
+      // Signal application-level graceful shutdown (e.g., HTTP/3 GOAWAY).
+      application().BeginShutdown();
+
+      // If there are no open streams, then we can close immediately and
+      // not worry about waiting around.
+      if (impl_->streams_.empty()) {
+        impl_->state_->silent_close = 0;
+        return FinishClose();
+      }
+
       Debug(this,
             "Gracefully closing session (waiting on %zu streams)",
             impl_->streams_.size());
@@ -1508,22 +1563,50 @@ void Session::FinishClose() {
   DCHECK(!is_destroyed());
   DCHECK(impl_->state_->closing);
 
-  // If impl_->Close() returns true, then the session can be destroyed
-  // immediately without round-tripping through JavaScript.
-  if (impl_->Close()) {
-    return Destroy();
+  // Clear the graceful_close flag to prevent RemoveStream() from
+  // re-entering FinishClose() when we destroy streams below.
+  impl_->state_->graceful_close = 0;
+
+  // Destroy all open streams immediately. We copy the map because
+  // streams remove themselves during destruction.
+  StreamsMap streams = impl_->streams_;
+  for (auto& stream : streams) {
+    stream.second->Destroy(impl_->last_error_);
   }
 
-  // Otherwise, we emit a close callback so that the JavaScript side can
-  // clean up anything it needs to clean up before destroying.
-  EmitClose();
+  // Clear pending stream queues.
+  while (!impl_->pending_bidi_stream_queue_.IsEmpty()) {
+    impl_->pending_bidi_stream_queue_.PopFront()->reject(impl_->last_error_);
+  }
+  while (!impl_->pending_uni_stream_queue_.IsEmpty()) {
+    impl_->pending_uni_stream_queue_.PopFront()->reject(impl_->last_error_);
+  }
+
+  // Send final application-level shutdown and CONNECTION_CLOSE
+  // unless this is a silent close.
+  if (!impl_->state_->silent_close) {
+    application().CompleteShutdown();
+    SendConnectionClose();
+  }
+
+  impl_->timer_.Close();
+
+  // If the session was passed to JavaScript, we need to round-trip
+  // through JS so it can clean up before we destroy. The JS side
+  // will synchronously call destroy(), which calls Session::Destroy().
+  if (impl_->state_->wrapped) {
+    EmitClose(impl_->last_error_);
+  } else {
+    Destroy();
+  }
 }
 
 void Session::Destroy() {
-  // Destroy() should be called only after, and as a result of, Close()
-  // being called first.
   DCHECK(impl_);
-  DCHECK(impl_->state_->closing);
+  // Ensure the closing flag is set for the ~Impl() DCHECK. Normally
+  // this is set by Session::Close(), but JS destroy() can be called
+  // directly without going through Close() first.
+  impl_->state_->closing = 1;
   Debug(this, "Session destroyed");
   impl_.reset();
   if (qlog_stream_ || keylog_stream_) {
@@ -1597,6 +1680,9 @@ std::unique_ptr<Session::Application> Session::SelectApplicationFromAlpn(
 void Session::SetApplication(std::unique_ptr<Application> app) {
   DCHECK(!impl_->application_);
   impl_->state_->application_type = static_cast<uint8_t>(app->type());
+  impl_->state_->headers_supported = static_cast<uint8_t>(
+      app->SupportsHeaders() ? HeadersSupportState::SUPPORTED
+                             : HeadersSupportState::UNSUPPORTED);
   impl_->application_ = std::move(app);
 }
 
@@ -1797,8 +1883,6 @@ void Session::Send(Packet::Ptr packet) {
   }
 
   Debug(this, "Session is sending %s", packet->ToString());
-  auto& stats_ = impl_->stats_;
-  STAT_INCREMENT_N(Stats, bytes_sent, packet->length());
   endpoint().Send(std::move(packet));
 }
 
@@ -1824,17 +1908,22 @@ datagram_id Session::SendDatagram(Store&& data) {
   const ngtcp2_transport_params* tp = remote_transport_params();
   uint64_t max_datagram_size = tp->max_datagram_frame_size;
 
+  // These size and length checks should have been caught by the JavaScript
+  // side, but handle it gracefully here just in case. We might have some future
+  // case where datagram frames are sent from C++ code directly, so it's good to
+  // have these checks as a backstop regardless.
+
   if (max_datagram_size == 0) {
     Debug(this, "Datagrams are disabled");
     return 0;
   }
 
-  if (data.length() > max_datagram_size) {
+  if (data.length() > max_datagram_size) [[unlikely]] {
     Debug(this, "Ignoring oversized datagram");
     return 0;
   }
 
-  if (data.length() == 0) {
+  if (data.length() == 0) [[unlikely]] {
     Debug(this, "Ignoring empty datagram");
     return 0;
   }
@@ -1845,6 +1934,11 @@ datagram_id Session::SendDatagram(Store&& data) {
   ngtcp2_vec vec = data;
   PathStorage path;
   int flags = NGTCP2_WRITE_DATAGRAM_FLAG_MORE;
+  // There's always the slightest possibility that the datagram ID could wrap
+  // around, but that's a lot of datagrams and we would have to be sending
+  // them at a very high rate for a very long time, so we'll just let it
+  // wrap around naturally if it ever does. If anyone accomplishes that feat,
+  // we can throw them a party.
   datagram_id did = impl_->state_->last_datagram_id + 1;
 
   Debug(this, "Sending %zu-byte datagram %" PRIu64, data.length(), did);
@@ -1953,7 +2047,7 @@ datagram_id Session::SendDatagram(Store&& data) {
           break;
         }
       }
-      SetLastError(QuicError::ForTransport(nwrite));
+      SetLastError(QuicError::ForNgtcp2Error(nwrite));
       Close(CloseMethod::SILENT);
       return 0;
     }
@@ -1972,7 +2066,6 @@ datagram_id Session::SendDatagram(Store&& data) {
       Debug(this, "Datagram %" PRIu64 " sent", did);
       auto& stats_ = impl_->stats_;
       STAT_INCREMENT(Stats, datagrams_sent);
-      STAT_INCREMENT_N(Stats, bytes_sent, vec.len);
       impl_->state_->last_datagram_id = did;
       return did;
     }
@@ -2252,7 +2345,9 @@ bool Session::is_in_draining_period() const {
 }
 
 bool Session::wants_session_ticket() const {
-  return !is_destroyed() && impl_->state_->session_ticket == 1;
+  return !is_destroyed() &&
+         HasListenerFlag(impl_->state_->listener_flags,
+                         SessionListenerFlags::SESSION_TICKET);
 }
 
 void Session::SetStreamOpenAllowed() {
@@ -2327,6 +2422,15 @@ void Session::UpdateDataStats() {
   STAT_SET(Stats, rttvar, info.rttvar);
   STAT_SET(Stats, smoothed_rtt, info.smoothed_rtt);
   STAT_SET(Stats, ssthresh, info.ssthresh);
+  STAT_SET(Stats, pkt_sent, info.pkt_sent);
+  STAT_SET(Stats, bytes_sent, info.bytes_sent);
+  STAT_SET(Stats, pkt_recv, info.pkt_recv);
+  STAT_SET(Stats, bytes_recv, info.bytes_recv);
+  STAT_SET(Stats, pkt_lost, info.pkt_lost);
+  STAT_SET(Stats, bytes_lost, info.bytes_lost);
+  STAT_SET(Stats, ping_recv, info.ping_recv);
+  STAT_SET(Stats, pkt_discarded, info.pkt_discarded);
+
   STAT_SET(
       Stats,
       max_bytes_in_flight,
@@ -2437,7 +2541,10 @@ void Session::DatagramStatus(datagram_id datagramId,
       break;
     }
   }
-  EmitDatagramStatus(datagramId, status);
+  if (HasListenerFlag(impl_->state_->listener_flags,
+                      SessionListenerFlags::DATAGRAM_STATUS)) {
+    EmitDatagramStatus(datagramId, status);
+  }
 }
 
 void Session::DatagramReceived(const uint8_t* data,
@@ -2446,7 +2553,10 @@ void Session::DatagramReceived(const uint8_t* data,
   DCHECK(!is_destroyed());
   // If there is nothing watching for the datagram on the JavaScript side,
   // or if the datagram is zero-length, we just drop it on the floor.
-  if (impl_->state_->datagram == 0 || datalen == 0) return;
+  if (!HasListenerFlag(impl_->state_->listener_flags,
+                       SessionListenerFlags::DATAGRAM) ||
+      datalen == 0)
+    return;
 
   Debug(this, "Session is receiving datagram of size %zu", datalen);
   auto& stats_ = impl_->stats_;
@@ -2458,7 +2568,7 @@ void Session::DatagramReceived(const uint8_t* data,
 
 void Session::GenerateNewConnectionId(ngtcp2_cid* cid,
                                       size_t len,
-                                      uint8_t* token) {
+                                      ngtcp2_stateless_reset_token* token) {
   DCHECK(!is_destroyed());
   CID cid_ = impl_->config_.options.cid_factory->GenerateInto(cid, len);
   Debug(this, "Generated new connection id %s", cid_);
@@ -2477,6 +2587,11 @@ bool Session::HandshakeCompleted() {
   auto& stats_ = impl_->stats_;
   STAT_RECORD_TIMESTAMP(Stats, handshake_completed_at);
   SetStreamOpenAllowed();
+
+  // Capture the peer's max datagram frame size from the remote transport
+  // parameters so JavaScript can check it without a C++ round-trip.
+  const ngtcp2_transport_params* tp = remote_transport_params();
+  impl_->state_->max_datagram_size = tp->max_datagram_frame_size;
 
   // If early data was attempted but rejected by the server,
   // tell ngtcp2 so it can retransmit the data as 1-RTT.
@@ -2744,7 +2859,8 @@ void Session::EmitPathValidation(PathValidationResult result,
 
   if (!env()->can_call_into_js()) return;
 
-  if (impl_->state_->path_validation == 0) [[likely]] {
+  if (!HasListenerFlag(impl_->state_->listener_flags,
+                       SessionListenerFlags::PATH_VALIDATION)) [[likely]] {
     return;
   }
 
@@ -2788,7 +2904,8 @@ void Session::EmitSessionTicket(Store&& ticket) {
 
   // If there is nothing listening for the session ticket, don't bother
   // emitting.
-  if (impl_->state_->session_ticket == 0) [[likely]] {
+  if (!HasListenerFlag(impl_->state_->listener_flags,
+                       SessionListenerFlags::SESSION_TICKET)) [[likely]] {
     Debug(this, "Session ticket was discarded");
     return;
   }
@@ -2812,6 +2929,9 @@ void Session::EmitSessionTicket(Store&& ticket) {
 
 void Session::EmitNewToken(const uint8_t* token, size_t len) {
   DCHECK(!is_destroyed());
+  if (!HasListenerFlag(impl_->state_->listener_flags,
+                       SessionListenerFlags::NEW_TOKEN))
+    return;
   if (!env()->can_call_into_js()) return;
 
   CallbackScope<Session> cb_scope(this);
@@ -2881,6 +3001,31 @@ void Session::EmitVersionNegotiation(const ngtcp2_pkt_hd& hd,
   MakeCallback(BindingData::Get(env()).session_version_negotiation_callback(),
                arraysize(argv),
                argv);
+}
+
+void Session::EmitOrigins(std::vector<std::string>&& origins) {
+  DCHECK(!is_destroyed());
+  if (!HasListenerFlag(impl_->state_->listener_flags,
+                       SessionListenerFlags::ORIGIN))
+    return;
+  if (!env()->can_call_into_js()) return;
+
+  CallbackScope<Session> cb_scope(this);
+
+  auto isolate = env()->isolate();
+
+  LocalVector<Value> elements(env()->isolate(), origins.size());
+  for (size_t i = 0; i < origins.size(); i++) {
+    Local<Value> str;
+    if (!ToV8Value(env()->context(), origins[i]).ToLocal(&str)) [[unlikely]] {
+      return;
+    }
+    elements[i] = str;
+  }
+
+  Local<Value> argv[] = {Array::New(isolate, elements.data(), elements.size())};
+  MakeCallback(
+      BindingData::Get(env()).session_origin_callback(), arraysize(argv), argv);
 }
 
 void Session::EmitKeylog(const char* line) {

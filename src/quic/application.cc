@@ -43,11 +43,13 @@ Session::Application_Options::operator const nghttp3_settings() const {
       .qpack_blocked_streams = static_cast<size_t>(qpack_blocked_streams),
       .enable_connect_protocol = enable_connect_protocol,
       .h3_datagram = enable_datagrams,
-      // TODO(@jasnell): Support origin frames?
+      // origin_list is nullptr here because it is set directly on the
+      // nghttp3_settings in Http3ApplicationImpl::InitializeConnection()
+      // from the SNI configuration.
       .origin_list = nullptr,
       .glitch_ratelim_burst = 1000,
       .glitch_ratelim_rate = 33,
-      .qpack_indexing_strat = NGHTTP3_QPACK_INDEXING_STRAT_NONE,
+      .qpack_indexing_strat = NGHTTP3_QPACK_INDEXING_STRAT_EAGER,
   };
 }
 
@@ -152,6 +154,18 @@ void Session::Application::BlockStream(int64_t id) {
   // By default do nothing.
 }
 
+bool Session::Application::SupportsHeaders() const {
+  return false;
+}
+
+void Session::Application::BeginShutdown() {
+  // By default, nothing to do.
+}
+
+void Session::Application::CompleteShutdown() {
+  // by default, nothing to do.
+}
+
 bool Session::Application::CanAddHeader(size_t current_count,
                                         size_t current_headers_length,
                                         size_t this_header_length) {
@@ -203,8 +217,9 @@ void Session::Application::SetStreamPriority(const Stream& stream,
   // By default do nothing.
 }
 
-StreamPriority Session::Application::GetStreamPriority(const Stream& stream) {
-  return StreamPriority::DEFAULT;
+Session::Application::StreamPriorityResult
+Session::Application::GetStreamPriority(const Stream& stream) {
+  return {StreamPriority::DEFAULT, StreamPriorityFlags::NON_INCREMENTAL};
 }
 
 Packet::Ptr Session::Application::CreateStreamDataPacket() {

@@ -1,7 +1,6 @@
 #if HAVE_OPENSSL && HAVE_QUIC
 #include "guard.h"
 #ifndef OPENSSL_NO_QUIC
-#include "streams.h"
 #include <aliased_struct-inl.h>
 #include <async_wrap-inl.h>
 #include <base_object-inl.h>
@@ -14,6 +13,7 @@
 #include "bindingdata.h"
 #include "defs.h"
 #include "session.h"
+#include "streams.h"
 
 namespace node {
 
@@ -43,6 +43,7 @@ namespace quic {
   V(READ_ENDED, read_ended, uint8_t)                                           \
   V(WRITE_ENDED, write_ended, uint8_t)                                         \
   V(RESET, reset, uint8_t)                                                     \
+  V(RESET_CODE, reset_code, uint64_t)                                          \
   V(HAS_OUTBOUND, has_outbound, uint8_t)                                       \
   V(HAS_READER, has_reader, uint8_t)                                           \
   /* Set when the stream has a block event handler */                          \
@@ -52,7 +53,8 @@ namespace quic {
   /* Set when the stream has a reset event handler */                          \
   V(WANTS_RESET, wants_reset, uint8_t)                                         \
   /* Set when the stream has a trailers event handler */                       \
-  V(WANTS_TRAILERS, wants_trailers, uint8_t)
+  V(WANTS_TRAILERS, wants_trailers, uint8_t)                                   \
+  V(WRITE_DESIRED_SIZE, write_desired_size, uint64_t)
 
 #define STREAM_STATS(V)                                                        \
   /* Marks the timestamp when the stream object was created. */                \
@@ -272,8 +274,7 @@ struct Stream::Impl {
 
   // Sends a block of headers to the peer. If the stream is not yet open,
   // the headers will be queued and sent immediately when the stream is
-  // opened. If the application does not support sending headers on streams,
-  // they will be ignored and dropped on the floor.
+  // opened. Returns false if the application does not support headers.
   JS_METHOD(SendHeaders) {
     Stream* stream;
     ASSIGN_OR_RETURN_UNWRAP(&stream, args.This());
@@ -287,8 +288,13 @@ struct Stream::Impl {
 
     // If the stream is pending, the headers will be queued until the
     // stream is opened, at which time the queued header block will be
-    // immediately sent when the stream is opened.
+    // immediately sent when the stream is opened. If we already know
+    // that the application does not support headers, return false
+    // immediately so the JS side can throw an appropriate error.
     if (stream->is_pending()) {
+      if (!stream->session().application().SupportsHeaders()) {
+        return args.GetReturnValue().Set(false);
+      }
       stream->EnqueuePendingHeaders(kind, headers, flags);
       return args.GetReturnValue().Set(true);
     }
@@ -355,18 +361,22 @@ struct Stream::Impl {
   JS_METHOD(SetPriority) {
     Stream* stream;
     ASSIGN_OR_RETURN_UNWRAP(&stream, args.This());
-    CHECK(args[0]->IsUint32());  // Priority
-    CHECK(args[1]->IsUint32());  // Priority flag
+    CHECK(args[0]->IsUint32());  // Packed: (urgency << 1) | incremental
 
-    StreamPriority priority = FromV8Value<StreamPriority>(args[0]);
-    StreamPriorityFlags flags = FromV8Value<StreamPriorityFlags>(args[1]);
+    uint32_t packed = args[0].As<v8::Uint32>()->Value();
+    StreamPriority priority = static_cast<StreamPriority>(packed >> 1);
+    StreamPriorityFlags flags = (packed & 1)
+                                    ? StreamPriorityFlags::INCREMENTAL
+                                    : StreamPriorityFlags::NON_INCREMENTAL;
 
-    if (stream->is_pending()) {
-      stream->pending_priority_ = PendingPriority{
-          .priority = priority,
-          .flags = flags,
-      };
-    } else {
+    // Always update the stored priority on the stream.
+    stream->priority_ = StoredPriority{
+        .priority = priority,
+        .flags = flags,
+        .pending = stream->is_pending(),
+    };
+
+    if (!stream->is_pending()) {
       stream->session().application().SetStreamPriority(
           *stream, priority, flags);
     }
@@ -376,13 +386,23 @@ struct Stream::Impl {
     Stream* stream;
     ASSIGN_OR_RETURN_UNWRAP(&stream, args.This());
 
-    if (stream->is_pending()) {
-      return args.GetReturnValue().Set(
-          static_cast<uint32_t>(StreamPriority::DEFAULT));
+    // On the client side, priority is always read from the stream's
+    // stored value since the client is the one setting it. On the
+    // server side, we delegate to the application which can read
+    // the peer's requested priority (e.g., from PRIORITY_UPDATE
+    // frames in HTTP/3).
+    if (!stream->session().is_server()) {
+      auto& pri = stream->priority_;
+      uint32_t packed = (static_cast<uint32_t>(pri.priority) << 1) |
+                        (pri.flags == StreamPriorityFlags::INCREMENTAL ? 1 : 0);
+      return args.GetReturnValue().Set(packed);
     }
 
-    auto priority = stream->session().application().GetStreamPriority(*stream);
-    args.GetReturnValue().Set(static_cast<uint32_t>(priority));
+    auto result = stream->session().application().GetStreamPriority(*stream);
+    uint32_t packed =
+        (static_cast<uint32_t>(result.priority) << 1) |
+        (result.flags == StreamPriorityFlags::INCREMENTAL ? 1 : 0);
+    args.GetReturnValue().Set(packed);
   }
 
   // Returns a Blob::Reader that can be used to read data that has been
@@ -505,6 +525,7 @@ class Stream::Outbound final : public MemoryRetainer {
 
   bool is_streaming() const { return streaming_; }
   size_t total() const { return total_; }
+  size_t uncommitted() const { return uncommitted_; }
 
   // Appends an entry to the underlying DataQueue. Only valid when
   // the Outbound was created in streaming mode.
@@ -969,20 +990,28 @@ void Stream::NotifyStreamOpened(stream_id id) {
   CHECK_EQ(ngtcp2_conn_set_stream_user_data(this->session(), id, this), 0);
   maybe_pending_stream_.reset();
 
-  if (pending_priority_) {
-    auto& priority = pending_priority_.value();
+  if (priority_.pending) {
     session().application().SetStreamPriority(
-        *this, priority.priority, priority.flags);
-    pending_priority_ = std::nullopt;
+        *this, priority_.priority, priority_.flags);
+    priority_.pending = false;
   }
-  decltype(pending_headers_queue_) queue;
-  pending_headers_queue_.swap(queue);
-  for (auto& headers : queue) {
-    // TODO(@jasnell): What if the application does not support headers?
-    session().application().SendHeaders(*this,
-                                        headers->kind,
-                                        headers->headers.Get(env()->isolate()),
-                                        headers->flags);
+  if (!pending_headers_queue_.empty()) {
+    if (!session().application().SupportsHeaders()) {
+      // Headers were enqueued while the application was not yet known
+      // (headers_supported == 0), and the negotiated application does
+      // not support headers. This is a fatal mismatch.
+      Destroy(QuicError::ForApplication(0));
+      return;
+    }
+    decltype(pending_headers_queue_) queue;
+    pending_headers_queue_.swap(queue);
+    for (auto& headers : queue) {
+      session().application().SendHeaders(
+          *this,
+          headers->kind,
+          headers->headers.Get(env()->isolate()),
+          headers->flags);
+    }
   }
   // If the stream is not a local undirectional stream and is_readable is
   // false, then we should shutdown the streams readable side now.
@@ -1161,6 +1190,7 @@ void Stream::WriteStreamData(const v8::FunctionCallbackInfo<v8::Value>& args) {
 
   if (!is_pending()) session_->ResumeStream(id());
 
+  UpdateWriteDesiredSize();
   args.GetReturnValue().Set(static_cast<double>(outbound_->total()));
 }
 
@@ -1256,6 +1286,7 @@ void Stream::Acknowledge(size_t datalen) {
   // Consumes the given number of bytes in the buffer.
   outbound_->Acknowledge(datalen);
   STAT_RECORD_TIMESTAMP(Stats, acked_at);
+  UpdateWriteDesiredSize();
 }
 
 void Stream::Commit(size_t datalen, bool fin) {
@@ -1383,6 +1414,7 @@ void Stream::ReceiveStreamReset(uint64_t final_size, QuicError error) {
         "Received stream reset with final size %" PRIu64 " and error %s",
         final_size,
         error);
+  state_->reset_code = error.code();
   EndReadable(final_size);
   EmitReset(error);
 }
@@ -1398,6 +1430,38 @@ void Stream::EmitBlocked() {
   }
   CallbackScope<Stream> cb_scope(this);
   MakeCallback(BindingData::Get(env()).stream_blocked_callback(), 0, nullptr);
+}
+
+void Stream::EmitDrain() {
+  if (!env()->can_call_into_js()) return;
+  CallbackScope<Stream> cb_scope(this);
+  MakeCallback(BindingData::Get(env()).stream_drain_callback(), 0, nullptr);
+}
+
+void Stream::UpdateWriteDesiredSize() {
+  if (!outbound_ || !outbound_->is_streaming()) return;
+
+  // Calculate available capacity based on QUIC flow control.
+  // The effective limit is the minimum of stream-level and
+  // connection-level flow control remaining.
+  ngtcp2_conn* conn = session();
+  uint64_t stream_left = ngtcp2_conn_get_max_stream_data_left(conn, id());
+  uint64_t conn_left = ngtcp2_conn_get_max_data_left(conn);
+  uint64_t available = std::min(stream_left, conn_left);
+
+  // Subtract uncommitted bytes — data queued but not yet sent.
+  // Committed bytes are already on the wire (retained only for
+  // retransmission) and don't count toward backpressure.
+  uint64_t buffered = outbound_->uncommitted();
+  uint64_t desired = (available > buffered) ? (available - buffered) : 0;
+
+  uint64_t old_size = state_->write_desired_size;
+  state_->write_desired_size = desired;
+
+  // Fire drain when transitioning from 0 to non-zero
+  if (old_size == 0 && desired > 0) {
+    EmitDrain();
+  }
 }
 
 void Stream::EmitClose(const QuicError& error) {

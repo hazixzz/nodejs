@@ -74,9 +74,9 @@ class Session final : public AsyncWrap, private SessionTicket::AppData::Source {
 
     // HTTP/3 specific options.
     uint64_t max_field_section_size = 0;
-    uint64_t qpack_max_dtable_capacity = 0;
-    uint64_t qpack_encoder_max_dtable_capacity = 0;
-    uint64_t qpack_blocked_streams = 0;
+    uint64_t qpack_max_dtable_capacity = 4096;
+    uint64_t qpack_encoder_max_dtable_capacity = 4096;
+    uint64_t qpack_blocked_streams = 100;
 
     bool enable_connect_protocol = true;
     bool enable_datagrams = true;
@@ -150,6 +150,11 @@ class Session final : public AsyncWrap, private SessionTicket::AppData::Source {
     // The amount of time (in milliseconds) that the endpoint will wait for the
     // completion of the tls handshake.
     uint64_t handshake_timeout = UINT64_MAX;
+
+    // The keep-alive timeout in milliseconds. When set to a non-zero value,
+    // ngtcp2 will automatically send PING frames to keep the connection alive
+    // before the idle timeout fires. Set to 0 to disable (default).
+    uint64_t keep_alive_timeout = 0;
 
     // Maximum initial flow control window size for a stream.
     uint64_t max_stream_window = 0;
@@ -475,6 +480,7 @@ class Session final : public AsyncWrap, private SessionTicket::AppData::Source {
   void EmitDatagramStatus(datagram_id id, DatagramStatus status);
   void EmitHandshakeComplete();
   void EmitKeylog(const char* line);
+  void EmitOrigins(std::vector<std::string>&& origins);
 
   struct ValidatedPath {
     std::shared_ptr<SocketAddress> local;
@@ -495,7 +501,9 @@ class Session final : public AsyncWrap, private SessionTicket::AppData::Source {
   void DatagramReceived(const uint8_t* data,
                         size_t datalen,
                         DatagramReceivedFlags flag);
-  void GenerateNewConnectionId(ngtcp2_cid* cid, size_t len, uint8_t* token);
+  void GenerateNewConnectionId(ngtcp2_cid* cid,
+                               size_t len,
+                               ngtcp2_stateless_reset_token* token);
   bool HandshakeCompleted();
   void HandshakeConfirmed();
   void SelectPreferredAddress(PreferredAddress* preferredAddress);

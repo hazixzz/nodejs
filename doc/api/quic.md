@@ -391,6 +391,36 @@ to complete but no new streams will be opened. Once all streams have closed,
 the session will be destroyed. The returned promise will be fulfilled once
 the session has been destroyed.
 
+### `session.opened`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Promise} for an {Object}
+  * `local` {net.SocketAddress} The local socket address.
+  * `remote` {net.SocketAddress} The remote socket address.
+  * `servername` {string} The SNI server name negotiated during the handshake.
+  * `protocol` {string} The ALPN protocol negotiated during the handshake.
+  * `cipher` {string} The name of the negotiated TLS cipher suite.
+  * `cipherVersion` {string} The TLS protocol version of the cipher suite
+    (e.g., `'TLSv1.3'`).
+  * `validationErrorReason` {string} If certificate validation failed, the
+    reason string. Empty string if validation succeeded.
+  * `validationErrorCode` {number} If certificate validation failed, the
+    error code. `0` if validation succeeded.
+  * `earlyDataAttempted` {boolean} Whether 0-RTT early data was attempted.
+  * `earlyDataAccepted` {boolean} Whether 0-RTT early data was accepted by
+    the server.
+
+A promise that is fulfilled once the TLS handshake completes successfully.
+The resolved value contains information about the established session
+including the negotiated protocol, cipher suite, certificate validation
+status, and 0-RTT early data status.
+
+If the handshake fails or the session is destroyed before the handshake
+completes, the promise will be rejected.
+
 ### `session.closed`
 
 <!-- YAML
@@ -502,6 +532,30 @@ added: v23.8.0
 
 The callback to invoke when the TLS handshake is completed. Read/write.
 
+### `session.onnewtoken`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {quic.OnNewTokenCallback}
+
+The callback to invoke when a NEW\_TOKEN token is received from the server.
+The token can be passed as the `token` option on a future connection to
+the same server to skip address validation. Read/write.
+
+### `session.onorigin`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {quic.OnOriginCallback}
+
+The callback to invoke when an ORIGIN frame (RFC 9412) is received from
+the server, indicating which origins the server is authoritative for.
+Read/write.
+
 ### `session.createBidirectionalStream([options])`
 
 <!-- YAML
@@ -510,11 +564,26 @@ added: v23.8.0
 
 * `options` {Object}
   * `body` {ArrayBuffer | ArrayBufferView | Blob}
-  * `sendOrder` {number}
+  * `headers` {Object} Initial request or response headers to send. Only
+    used when the session supports headers (e.g. HTTP/3). If `body` is not
+    specified and `headers` is provided, the stream is treated as
+    headers-only (terminal).
+  * `priority` {string} The priority level of the stream. One of `'high'`,
+    `'default'`, or `'low'`. **Default:** `'default'`.
+  * `incremental` {boolean} When `true`, data from this stream may be
+    interleaved with data from other streams of the same priority level.
+    When `false`, the stream should be completed before same-priority peers.
+    **Default:** `false`.
+  * `onheaders` {quic.OnHeadersCallback} Callback for received headers.
+  * `ontrailers` {quic.OnTrailersCallback} Callback for received trailers.
+  * `onwanttrailers` {Function} Callback when trailers should be sent.
 * Returns: {Promise} for a {quic.QuicStream}
 
 Open a new bidirectional stream. If the `body` option is not specified,
-the outgoing stream will be half-closed.
+the outgoing stream will be half-closed. The `priority` and `incremental`
+options are only used when the session supports priority (e.g. HTTP/3).
+The `headers`, `onheaders`, `ontrailers`, and `onwanttrailers` options
+are only used when the session supports headers (e.g. HTTP/3).
 
 ### `session.createUnidirectionalStream([options])`
 
@@ -524,11 +593,21 @@ added: v23.8.0
 
 * `options` {Object}
   * `body` {ArrayBuffer | ArrayBufferView | Blob}
-  * `sendOrder` {number}
+  * `headers` {Object} Initial request headers to send.
+  * `priority` {string} The priority level of the stream. One of `'high'`,
+    `'default'`, or `'low'`. **Default:** `'default'`.
+  * `incremental` {boolean} When `true`, data from this stream may be
+    interleaved with data from other streams of the same priority level.
+    When `false`, the stream should be completed before same-priority peers.
+    **Default:** `false`.
+  * `onheaders` {quic.OnHeadersCallback} Callback for received headers.
+  * `ontrailers` {quic.OnTrailersCallback} Callback for received trailers.
+  * `onwanttrailers` {Function} Callback when trailers should be sent.
 * Returns: {Promise} for a {quic.QuicStream}
 
 Open a new unidirectional stream. If the `body` option is not specified,
-the outgoing stream will be closed.
+the outgoing stream will be closed. The `priority` and `incremental`
+options are only used when the session supports priority (e.g. HTTP/3).
 
 ### `session.path`
 
@@ -542,18 +621,92 @@ added: v23.8.0
 
 The local and remote socket addresses associated with the session. Read only.
 
-### `session.sendDatagram(datagram)`
+### `session.sendDatagram(datagram[, encoding])`
 
 <!-- YAML
 added: v23.8.0
 -->
 
-* `datagram` {string|ArrayBufferView}
-* Returns: {bigint}
+* `datagram` {string|ArrayBufferView|Promise}
+* `encoding` {string} The encoding to use if `datagram` is a string.
+  **Default:** `'utf8'`.
+* Returns: {Promise} for a {bigint} datagram ID.
 
-Sends an unreliable datagram to the remote peer, returning the datagram ID.
-If the datagram payload is specified as an `ArrayBufferView`, then ownership of
-that view will be transferred to the underlying stream.
+Sends an unreliable datagram to the remote peer, returning a promise for
+the datagram ID.
+
+If `datagram` is a string, it will be encoded using the specified `encoding`.
+
+If `datagram` is an `ArrayBufferView`, the underlying `ArrayBuffer` will be
+transferred if possible (taking ownership to prevent mutation after send).
+If the buffer is not transferable (e.g., a `SharedArrayBuffer` or a view
+over a subset of a larger buffer such as a pooled `Buffer`), the data will
+be copied instead.
+
+If `datagram` is a `Promise`, it will be awaited before sending. If the
+session closes while awaiting, `0n` is returned silently (datagrams are
+inherently unreliable).
+
+If the datagram payload is zero-length (empty string after encoding, detached
+buffer, or zero-length view), `0n` is returned and no datagram is sent.
+
+Datagrams cannot be fragmented — each must fit within a single QUIC packet.
+The maximum datagram size is determined by the peer's
+`maxDatagramFrameSize` transport parameter (which the peer advertises during
+the handshake). If the peer sets this to `0`, datagrams are not supported
+and `0n` will be returned. If the datagram exceeds the peer's limit, it
+will be silently dropped and `0n` returned. The local
+`maxDatagramFrameSize` transport parameter (default: `1200` bytes) controls
+what this endpoint advertises to the peer as its own maximum.
+
+### `session.certificate`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Object|undefined}
+
+The local certificate as an object with properties such as `subject`,
+`issuer`, `valid_from`, `valid_to`, `fingerprint`, etc. Returns `undefined`
+if the session is destroyed or no certificate is available.
+
+### `session.peerCertificate`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Object|undefined}
+
+The peer's certificate as an object with properties such as `subject`,
+`issuer`, `valid_from`, `valid_to`, `fingerprint`, etc. Returns `undefined`
+if the session is destroyed or the peer did not present a certificate.
+
+### `session.ephemeralKeyInfo`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Object|undefined}
+
+The ephemeral key information for the session, with properties such as
+`type`, `name`, and `size`. Only available on client sessions. Returns
+`undefined` for server sessions or if the session is destroyed.
+
+### `session.maxDatagramSize`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {bigint}
+
+The maximum datagram payload size in bytes that the peer will accept,
+as advertised in the peer's `maxDatagramFrameSize` transport parameter.
+Returns `0n` if the peer does not support datagrams or if the handshake
+has not yet completed. Datagrams larger than this value will not be sent.
 
 ### `session.stats`
 
@@ -668,7 +821,7 @@ added: v23.8.0
 
 * Type: {bigint}
 
-### `sessionStats.maxBytesInFlights`
+### `sessionStats.maxBytesInFlight`
 
 <!-- YAML
 added: v23.8.0
@@ -848,13 +1001,239 @@ added: v23.8.0
 
 The callback to invoke when the stream is reset. Read/write.
 
-### `stream.readable`
+### `stream.headers`
 
 <!-- YAML
-added: v23.8.0
+added: REPLACEME
 -->
 
-* Type: {ReadableStream}
+* Type: {Object|undefined}
+
+The buffered initial headers received on this stream, or `undefined` if the
+application does not support headers or no headers have been received yet.
+For server-side streams, this contains the request headers (e.g., `:method`,
+`:path`, `:scheme`). For client-side streams, this contains the response
+headers (e.g., `:status`).
+
+Header names are lowercase strings. Multi-value headers are represented as
+arrays. The object has `__proto__: null`.
+
+### `stream.onheaders`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {quic.OnHeadersCallback}
+
+The callback to invoke when headers are received on the stream. The callback
+receives `(headers, kind)` where `headers` is an object (same format as
+`stream.headers`) and `kind` is one of `'initial'` or `'informational'`
+(for 1xx responses). Throws `ERR_INVALID_STATE` if set on a session that
+does not support headers. Read/write.
+
+### `stream.ontrailers`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {quic.OnTrailersCallback}
+
+The callback to invoke when trailing headers are received from the peer.
+The callback receives `(trailers)` where `trailers` is an object in the
+same format as `stream.headers`. Throws `ERR_INVALID_STATE` if set on a
+session that does not support headers. Read/write.
+
+### `stream.onwanttrailers`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Function}
+
+The callback to invoke when the application is ready for trailing headers
+to be sent. This is called synchronously — the user must call
+[`stream.sendTrailers()`][] within this callback. Throws
+`ERR_INVALID_STATE` if set on a session that does not support headers.
+Read/write.
+
+### `stream.pendingTrailers`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Object|undefined}
+
+Set trailing headers to be sent automatically when the application requests
+them. This is an alternative to the [`stream.onwanttrailers`][] callback
+for cases where the trailers are known before the body completes. Throws
+`ERR_INVALID_STATE` if set on a session that does not support headers.
+Read/write.
+
+### `stream.sendHeaders(headers[, options])`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `headers` {Object} Header object with string keys and string or
+  string-array values. Pseudo-headers (`:method`, `:path`, etc.) must
+  appear before regular headers.
+* `options` {Object}
+  * `terminal` {boolean} If `true`, the stream is closed for sending
+    after the headers (no body will follow). **Default:** `false`.
+* Returns: {boolean}
+
+Sends initial or response headers on the stream. For client-side streams,
+this sends request headers. For server-side streams, this sends response
+headers. Throws `ERR_INVALID_STATE` if the session does not support headers.
+
+### `stream.sendInformationalHeaders(headers)`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `headers` {Object} Header object. Must include `:status` with a 1xx
+  value (e.g., `{ ':status': '103', 'link': '</style.css>; rel=preload' }`).
+* Returns: {boolean}
+
+Sends informational (1xx) response headers. Server only. Throws
+`ERR_INVALID_STATE` if the session does not support headers.
+
+### `stream.sendTrailers(headers)`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `headers` {Object} Trailing header object. Pseudo-headers must not be
+  included in trailers.
+* Returns: {boolean}
+
+Sends trailing headers on the stream. Must be called synchronously during
+the [`stream.onwanttrailers`][] callback, or set ahead of time via
+[`stream.pendingTrailers`][]. Throws `ERR_INVALID_STATE` if the session
+does not support headers.
+
+### `stream.priority`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Object|null}
+  * `level` {string} One of `'high'`, `'default'`, or `'low'`.
+  * `incremental` {boolean} Whether the stream data should be interleaved
+    with other streams of the same priority level.
+
+The current priority of the stream. Returns `null` if the session does not
+support priority (e.g. non-HTTP/3) or if the stream has been destroyed.
+Read only. Use [`stream.setPriority()`][] to change the priority.
+
+On client-side HTTP/3 sessions, the value reflects what was set via
+[`stream.setPriority()`][]. On server-side HTTP/3 sessions, the value
+reflects the peer's requested priority (e.g., from `PRIORITY_UPDATE` frames).
+
+### `stream.setPriority([options])`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `options` {Object}
+  * `level` {string} The priority level. One of `'high'`, `'default'`, or
+    `'low'`. **Default:** `'default'`.
+  * `incremental` {boolean} When `true`, data from this stream may be
+    interleaved with data from other streams of the same priority level.
+    **Default:** `false`.
+
+Sets the priority of the stream. Throws `ERR_INVALID_STATE` if the session
+does not support priority (e.g. non-HTTP/3). Has no effect if the stream
+has been destroyed.
+
+### `stream[Symbol.asyncIterator]()`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Returns: {AsyncIterableIterator} yielding {Uint8Array\[]}
+
+The stream implements `Symbol.asyncIterator`, making it directly usable
+in `for await...of` loops. Each iteration yields a batch of `Uint8Array`
+chunks.
+
+Only one async iterator can be obtained per stream. A second call throws
+`ERR_INVALID_STATE`. Non-readable streams (outbound-only unidirectional
+or closed) return an immediately-finished iterator.
+
+```mjs
+for await (const chunks of stream) {
+  for (const chunk of chunks) {
+    // Process each Uint8Array chunk
+  }
+}
+```
+
+Compatible with stream/iter utilities:
+
+```mjs
+import Stream from 'node:stream/iter';
+const body = await Stream.bytes(stream);
+const text = await Stream.text(stream);
+await Stream.pipeTo(stream, someWriter);
+```
+
+### `stream.writer`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {Object}
+
+Returns a Writer object for pushing data to the stream incrementally.
+The Writer implements the stream/iter Writer interface with the
+try-sync-fallback-to-async pattern.
+
+Only available when no `body` source was provided at creation time or via
+[`stream.setBody()`][]. Non-writable streams return an already-closed
+Writer. Throws `ERR_INVALID_STATE` if the outbound is already configured.
+
+The Writer has the following methods:
+
+* `writeSync(chunk)` — Synchronous write. Returns `true` if accepted,
+  `false` if flow-controlled. Data is NOT accepted on `false`.
+* `write(chunk[, options])` — Async write with drain wait. `options.signal`
+  is checked at entry but not observed during the write.
+* `writevSync(chunks)` — Synchronous vectored write. All-or-nothing.
+* `writev(chunks[, options])` — Async vectored write.
+* `endSync()` — Synchronous close. Returns total bytes or `-1`.
+* `end([options])` — Async close.
+* `fail(reason)` — Errors the stream (sends RESET\_STREAM to peer).
+* `desiredSize` — Available capacity in bytes, or `null` if closed/errored.
+
+### `stream.setBody(body)`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `body` {string|ArrayBuffer|SharedArrayBuffer|TypedArray|Blob|AsyncIterable|Iterable|Promise|null}
+
+Sets the outbound body source for the stream. Can only be called once.
+Mutually exclusive with [`stream.writer`][].
+
+If `body` is `null`, the writable side is closed immediately (FIN sent).
+If `body` is a `Promise`, it is awaited and the resolved value is used.
+Other types are handled per their optimization tier (see below).
+
+Throws `ERR_INVALID_STATE` if the outbound is already configured or if
+the writer has been accessed.
 
 ### `stream.session`
 
@@ -1224,6 +1603,19 @@ added: v23.8.0
 The CRL to use for client sessions. For server sessions, CRLs are specified
 per-identity in the [`sessionOptions.sni`][] map.
 
+#### `sessionOptions.enableEarlyData`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {boolean} **Default:** `true`
+
+When `true`, enables TLS 0-RTT early data for this session. Early data
+allows the client to send application data before the TLS handshake
+completes, reducing latency on reconnection when a valid session ticket
+is available. Set to `false` to disable early data support.
+
 #### `sessionOptions.groups`
 
 <!-- YAML
@@ -1342,6 +1734,20 @@ added: v23.8.0
 Specifies the maximum number of milliseconds a TLS handshake is permitted to take
 to complete before timing out.
 
+#### `sessionOptions.keepAlive`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {bigint|number}
+* **Default:** `0` (disabled)
+
+Specifies the keep-alive timeout in milliseconds. When set to a non-zero
+value, PING frames will be sent automatically to keep the connection alive
+before the idle timeout fires. The value should be less than the effective
+idle timeout (`maxIdleTimeout` transport parameter) to be useful.
+
 #### `sessionOptions.servername` (client only)
 
 <!-- YAML
@@ -1373,13 +1779,20 @@ no other host name matches. Each entry may contain:
 * `crl` {ArrayBuffer|ArrayBufferView|ArrayBuffer\[]|ArrayBufferView\[]}
   Optional certificate revocation lists.
 * `verifyPrivateKey` {boolean} Verify the private key. Default: `false`.
+* `port` {number} The port to advertise in ORIGIN frames (RFC 9412) for
+  this host name. **Default:** `443`. Only used for HTTP/3 sessions.
+* `authoritative` {boolean} Whether to include this host name in ORIGIN
+  frames. **Default:** `true`. Set to `false` to exclude a host name
+  from ORIGIN advertisements. Wildcard (`'*'`) entries are always
+  excluded regardless of this setting.
 
 ```mjs
 const endpoint = await listen(callback, {
   sni: {
     '*': { keys: [defaultKey], certs: [defaultCert] },
-    'api.example.com': { keys: [apiKey], certs: [apiCert] },
+    'api.example.com': { keys: [apiKey], certs: [apiCert], port: 8443 },
     'www.example.com': { keys: [wwwKey], certs: [wwwCert], ca: [customCA] },
+    'internal.example.com': { keys: [intKey], certs: [intCert], authoritative: false },
   },
 });
 ```
@@ -1403,6 +1816,19 @@ added: v23.8.0
 
 True to enable TLS tracing output.
 
+#### `sessionOptions.token` (client only)
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {ArrayBufferView}
+
+An opaque address validation token previously received from the server
+via the [`session.onnewtoken`][] callback. Providing a valid token on
+reconnection allows the client to skip the server's address validation,
+reducing handshake latency.
+
 #### `sessionOptions.transportParams`
 
 <!-- YAML
@@ -1422,6 +1848,20 @@ added: v23.8.0
 * Type: {bigint|number}
 
 Specifies the maximum number of unacknowledged packets a session should allow.
+
+#### `sessionOptions.rejectUnauthorized`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {boolean} **Default:** `true`
+
+If `true`, the peer certificate is verified against the list of supplied CAs.
+An error is emitted if verification fails; the error can be inspected via
+the `validationErrorReason` and `validationErrorCode` fields in the
+handshake callback. If `false`, peer certificate verification errors are
+ignored.
 
 #### `sessionOptions.verifyClient`
 
@@ -1565,6 +2005,13 @@ added: v23.8.0
 -->
 
 * Type: {bigint|number}
+* **Default:** `1200`
+
+The maximum size in bytes of a DATAGRAM frame payload that this endpoint
+is willing to receive. Set to `0` to disable datagram support. The peer
+will not send datagrams larger than this value. The actual maximum size of
+a datagram that can be _sent_ is determined by the peer's
+`maxDatagramFrameSize`, not this endpoint's value.
 
 ## Callbacks
 
@@ -1655,7 +2102,27 @@ added: v23.8.0
 * `cipherVersion` {string}
 * `validationErrorReason` {string}
 * `validationErrorCode` {number}
+* `earlyDataAttempted` {boolean}
 * `earlyDataAccepted` {boolean}
+
+### Callback: `OnNewTokenCallback`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `this` {quic.QuicSession}
+* `token` {Buffer} The NEW\_TOKEN token data.
+* `address` {SocketAddress} The remote address the token is associated with.
+
+### Callback: `OnOriginCallback`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `this` {quic.QuicSession}
+* `origins` {string\[]} The list of origins the server is authoritative for.
 
 ### Callback: `OnBlockedCallback`
 
@@ -1673,6 +2140,26 @@ added: v23.8.0
 
 * `this` {quic.QuicStream}
 * `error` {any}
+
+### Callback: `OnHeadersCallback`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `this` {quic.QuicStream}
+* `headers` {Object} Header object with lowercase string keys and
+  string or string-array values.
+* `kind` {string} One of `'initial'` or `'informational'`.
+
+### Callback: `OnTrailersCallback`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+* `this` {quic.QuicStream}
+* `trailers` {Object} Trailing header object.
 
 ## Diagnostic Channels
 
@@ -1795,6 +2282,16 @@ added: v23.8.0
 added: v23.8.0
 -->
 
+### Channel: `quic.session.new.token`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+Published when a client session receives a NEW\_TOKEN frame from the
+server. The message contains `token` {Buffer}, `address` {SocketAddress},
+and `session` {quic.QuicSession}.
+
 ### Channel: `quic.session.ticket`
 
 <!-- YAML
@@ -1813,4 +2310,11 @@ added: v23.8.0
 added: v23.8.0
 -->
 
+[`session.onnewtoken`]: #sessiononnewtoken
 [`sessionOptions.sni`]: #sessionoptionssni-server-only
+[`stream.onwanttrailers`]: #streamonwanttrailers
+[`stream.pendingTrailers`]: #streampendingtrailers
+[`stream.sendTrailers()`]: #streamsendtrailersheaders
+[`stream.setBody()`]: #streamsetbodybody
+[`stream.setPriority()`]: #streamsetpriorityoptions
+[`stream.writer`]: #streamwriter
